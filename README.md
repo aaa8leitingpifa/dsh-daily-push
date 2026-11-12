@@ -2,6 +2,8 @@
 
 > 在 DSH 侧栏里，把「今天有哪些新插件」变成一张能一眼扫完的榜。
 
+![面板截图](docs/screenshot.jpg)
+
 一个给 [DeepSeek Harness](https://www.deepseek.com/download/) 用的插件发现面板：三个榜单并列、官方仓库单独追踪、内置咨询和关注。
 
 ## 它解决什么问题
