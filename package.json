@@ -1,0 +1,55 @@
+{
+  "name": "dsh-daily-push",
+  "version": "0.1.0",
+  "description": "每日推送：DSH 插件雷达。星数榜 / 新建榜 / 活跃榜三榜并列，官方仓库单独追踪，内置咨询（问某个插件值不值得装）、关注列表与已装插件更新提醒。",
+  "license": "MIT",
+  "author": "dsh-daily-push contributors",
+  "type": "module",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "icon.svg"
+  ],
+  "engines": {
+    "node": ">=22",
+    "dsh": ">=0.2.1-rc.1"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "plugin-discovery",
+    "github",
+    "dashboard",
+    "chinese"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/aaa8leitingpifa/dsh-daily-push.git"
+  },
+  "homepage": "https://github.com/aaa8leitingpifa/dsh-daily-push#readme",
+  "bugs": {
+    "url": "https://github.com/aaa8leitingpifa/dsh-daily-push/issues"
+  },
+  "meta": {
+    "title": "每日推送",
+    "description": "三榜并列的 DSH 插件雷达：星数、新建、活跃各一榜，官方仓库单独追踪，可咨询、可关注。"
+  },
+  "icon": "./icon.svg",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": []
+    }
+  }
+}
