@@ -1,0 +1,6 @@
+# dsh-daily-push：一个只做浏览器侧渲染的 bundle。
+# 浏览器半由 client-modules 扫 package.json 的 dsh.client 自动供给 /plugins/dsh-daily-push/client.js，
+# 不需要额外的 loader 行。
+- insert:
+    - id: dsh-daily-push
+      name: dsh-daily-push
