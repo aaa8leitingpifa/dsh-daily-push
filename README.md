@@ -2,7 +2,7 @@
 
 > 在 DSH 侧栏里，把「今天有哪些新插件」变成一张能一眼扫完的榜。
 
-![面板截图](docs/screenshot.jpg)
+![面板截图](https://raw.githubusercontent.com/aaa8leitingpifa/dsh-daily-push/main/docs/screenshot.jpg)
 
 一个给 [DeepSeek Harness](https://www.deepseek.com/download/) 用的插件发现面板：三个榜单并列、官方仓库单独追踪、内置咨询和关注。
 
@@ -43,10 +43,16 @@ DSH 的插件生态在 GitHub 上，靠 `dsh-plugin` 标签自发聚集。问题
 ## 安装
 
 ```bash
-dsh plugin --profile desktop add git+https://github.com/aaa8leitingpifa/dsh-daily-push
+dsh plugin add dsh-daily-push
 ```
 
 装完重启 DSH，左侧栏会出现「每日推送」。
+
+也可以直接从 GitHub 装（跟 npm 版同一份代码）：
+
+```bash
+dsh plugin add git+https://github.com/aaa8leitingpifa/dsh-daily-push
+```
 
 要求：
 
@@ -57,7 +63,7 @@ dsh plugin --profile desktop add git+https://github.com/aaa8leitingpifa/dsh-dail
 卸载：
 
 ```bash
-dsh plugin --profile desktop remove dsh-daily-push
+dsh plugin remove dsh-daily-push
 ```
 
 ## 功能
