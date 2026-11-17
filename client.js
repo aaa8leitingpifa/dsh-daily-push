@@ -164,6 +164,22 @@ window.__ModuleLoader__.load({
       }
     }
 
+    /** 24MB 的名单每次开面板都重新下载+解析，光解析峰值就上百兆。
+     *  模块级缓存 10 分钟：同一会话里反复开关面板不再重复付这笔账。 */
+    const REG_TTL_MS = 10 * 60 * 1000;
+    let registryCache = { at: 0, plugins: [], generatedAt: '' };
+    async function loadRegistry() {
+      if (registryCache.plugins.length && Date.now() - registryCache.at < REG_TTL_MS) return registryCache;
+      const doc = await fetchJson(REGISTRY_URL, { cache: 'no-store' });
+      if (!doc || !Array.isArray(doc.plugins)) throw new Error('榜单数据结构异常');
+      registryCache = {
+        at: Date.now(),
+        plugins: trimRegistry(doc.plugins),
+        generatedAt: (doc.meta && doc.meta.generatedAt) || '',
+      };
+      return registryCache;
+    }
+
     async function fetchJson(url, init) {
       const res = await fetch(url, init);
       if (!res.ok) throw new Error(String(url) + ' · HTTP ' + res.status);
@@ -873,6 +889,20 @@ window.__ModuleLoader__.load({
       }
     }
 
+    /** 流式回介绍时一条一条来，每条都整表 JSON.stringify 写 localStorage 太贵
+     *  （一次批量 12 条 = 12 次全量序列化）。合并成 600ms 一次。 */
+    let introWriteTimer = 0;
+    function writeIntroCacheSoon(cache) {
+      try {
+        clearTimeout(introWriteTimer);
+      } catch {
+        /* 没有定时器也能继续 */
+      }
+      introWriteTimer = setTimeout(() => {
+        writeIntroCache(cache);
+      }, 600);
+    }
+
     function writeIntroCache(cache) {
       try {
         const keys = Object.keys(cache);
@@ -981,6 +1011,29 @@ window.__ModuleLoader__.load({
       return out;
     }
 
+    /** registry.json 有 1.6 万条、24MB：整份留在 state 里会把面板内存顶到 GB 级。
+     *  只保留榜单与候选匹配用得到的字段，description 截断——界面看不出差别，内存降一个数量级。 */
+    const REG_DESC_MAX = 300;
+    function trimRegistry(plugins) {
+      const out = [];
+      for (const p of plugins || []) {
+        if (!p || !p.fullName) continue;
+        out.push({
+          fullName: p.fullName,
+          url: p.url || '',
+          description: typeof p.description === 'string' ? p.description.slice(0, REG_DESC_MAX) : '',
+          stars: p.stars || 0,
+          pushedAt: p.pushedAt || '',
+          createdAt: p.createdAt || '',
+          topics: Array.isArray(p.topics) ? p.topics.slice(0, 8) : [],
+          language: p.language || '',
+          archived: !!p.archived,
+          fork: !!p.fork,
+        });
+      }
+      return out;
+    }
+
     /** 3700 → 3.7k，报纸上数字要短。*/
     function fmtStars(n) {
       const v = n || 0;
@@ -991,9 +1044,15 @@ window.__ModuleLoader__.load({
 
     /* ───────────────────────── 小组件 ───────────────────────── */
 
-    /** 安装命令：和 DSH 文档里的一致，profile 固定 web。*/
+    /** 安装命令。
+     *  `git clone` 只是把代码抄到本地，DSH 并不认识它——真正装上要的是 `dsh plugin add`：
+     *  npm 上的包直接给包名；只有 GitHub 仓库的给 `git+https://…`（pnpm 认这种依赖）。 */
     function installCmd(p) {
-      return 'dsh plugin --profile web add github:' + String((p && p.fullName) || '');
+      if (!p) return 'dsh plugin add ';
+      if (p.source === 'npm' || p.source === 'both' || (p.name && !String(p.fullName || '').includes('/'))) {
+        return 'dsh plugin add ' + String(p.name || p.fullName || '');
+      }
+      return 'dsh plugin add git+https://github.com/' + String(p.fullName || '');
     }
 
     function repoUrl(p) {
@@ -1087,14 +1146,14 @@ window.__ModuleLoader__.load({
       return nodes.length ? nodes : str;
     }
 
-    /** 参考条里的一枚仓库：名字可点、能复制 clone、能下 ZIP。*/
+    /** 参考条里的一枚仓库：名字可点、能复制安装命令、能下 ZIP。*/
     function RefChip(props) {
       const name = String(props.name || '');
       const url = 'https://github.com/' + name;
-      const clone = 'git clone ' + url + '.git';
+      const install = 'dsh plugin add git+https://github.com/' + name;
       const [done, setDone] = useState('');
       const onCopy = () => {
-        copyText(clone);
+        copyText(install);
         setDone('1');
         setTimeout(() => setDone(''), 1200);
       };
@@ -1115,7 +1174,7 @@ window.__ModuleLoader__.load({
         'span',
         { className: 'fr-ref' },
         h('a', { className: 'fr-ref-n', href: url, target: '_blank', rel: 'noreferrer', title: url }, name),
-        h('button', { className: 'fr-ref-b', onClick: onCopy, title: clone }, done ? '已复制' : 'clone'),
+        h('button', { className: 'fr-ref-b', onClick: onCopy, title: install }, done ? '已复制' : '安装'),
         h(
           'button',
           {
@@ -1418,9 +1477,10 @@ window.__ModuleLoader__.load({
         setError(null);
         let doc = null;
         try {
-          doc = await fetchJson(REGISTRY_URL, { cache: 'no-store' });
-          if (!doc || !Array.isArray(doc.plugins)) throw new Error('榜单数据结构异常');
-          setRegistry(doc);
+          const reg = await loadRegistry();
+          if (!reg || !reg.plugins.length) throw new Error('榜单数据结构异常');
+          doc = { plugins: reg.plugins };
+          setRegistry({ plugins: reg.plugins, meta: { generatedAt: reg.generatedAt } });
         } catch (err) {
           setError(err instanceof Error ? err.message : String(err));
         }
@@ -1630,7 +1690,7 @@ window.__ModuleLoader__.load({
                   at: Date.now(),
                 };
                 introRef.current = next;
-                writeIntroCache(next);
+(next);
                 setIntroCache(next);
               });
             })
@@ -2027,6 +2087,709 @@ window.__ModuleLoader__.load({
       const d = Math.round(daysBetween(p.pushedAt) || 0);
       if (p.pushedAt) bits.push(d <= 0 ? '今天更新' : d + ' 天前更新');
       return bits.join(' · ');
+    }
+
+    /* ───────────────────────── 关联词表（搜索用） ─────────────────────────
+       一个"场景"一行：
+         core  用户真正会打出来的词；
+         near  同一个场景里的衍生词（搜"书籍"时"书签、书壳"也要出来，但排在后面）；
+         en    真正拿去比英文 description / topics 的词（GitHub 数据几乎都是英文）。
+       权重：命中的原词 1.0；core 的中文近义 0.6；near 的中文 0.45；
+             en 前半 0.9、后半 0.55。加词只改这个数组，不动逻辑。 */
+    const LEXICON = [
+      { id: 'bookmark', label: '书签收藏', core: ['书签', '收藏夹', '稍后读', '书签栏', '收藏'], near: ['收藏夹管理', '标签页', '书签同步'], en: ['bookmark', 'bookmarks', 'readlater', 'favorite', 'tabs', 'pin'] },
+      { id: 'book', label: '读书', core: ['书籍', '读书', '阅读', '电子书', '小说'], near: ['书签', '书壳', '书架', '书评', '图书', '阅读器', '藏书', '听书'], en: ['book', 'ebook', 'epub', 'mobi', 'pdf', 'reader', 'reading', 'library', 'shelf', 'bookmark', 'kindle', 'novel'] },
+      { id: 'notes', label: '笔记', core: ['笔记', '知识库', '知识管理', '文档库'], near: ['双链', '反链', '标签', '归档', '收藏'], en: ['note', 'notes', 'knowledge', 'wiki', 'obsidian', 'markdown', 'memo', 'clip', 'archive'] },
+      { id: 'write', label: '写作', core: ['写作', '文案', '润色', '续写', '改稿'], near: ['大纲', '标题', '摘要', '校对'], en: ['writ', 'copywrit', 'polish', 'draft', 'outline', 'summar', 'proofread', 'rewrit'] },
+      { id: 'task', label: '任务', core: ['任务', '待办', '看板', '清单', '项目管理'], near: ['日程', '提醒', '优先级', '分工'], en: ['task', 'todo', 'kanban', 'board', 'project', 'checklist', 'issue', 'jira', 'linear'] },
+      { id: 'theme', label: '界面', core: ['界面', '主题', '美化', '皮肤', '外观'], near: ['深色', '浅色', '透明', '圆角', '字号', '布局'], en: ['theme', 'skin', 'ui', 'appearance', 'dark', 'light', 'layout', 'style', 'css'] },
+      { id: 'wallpaper', label: '壁纸', core: ['壁纸', '桌面美化', '动态壁纸', '桌面背景'], near: ['屏保', '锁屏'], en: ['wallpaper', 'live-wallpaper', 'desktop', 'background', 'screensaver', 'scene'] },
+      { id: 'iconfont', label: '图标字体', core: ['图标', '字体'], near: ['图标包', '表情'], en: ['icon', 'font', 'emoji', 'glyph', 'svg'] },
+      { id: 'search', label: '搜索', core: ['搜索', '检索', '查找', '全文搜索'], near: ['索引', '过滤', '模糊搜索'], en: ['search', 'find', 'query', 'retriev', 'index', 'filter', 'grep'] },
+      { id: 'memory', label: '记忆', core: ['记忆', '长期记忆', '回忆'], near: ['遗忘', '知识沉淀'], en: ['memory', 'recall', 'remember', 'memor', 'long-term'] },
+      { id: 'context', label: '上下文', core: ['上下文', '压缩', '摘要'], near: ['裁剪', '截断', '预算'], en: ['context', 'compact', 'compress', 'summar', 'token', 'budget', 'truncat'] },
+      { id: 'i18n', label: '翻译', core: ['翻译', '汉化', '多语言', '本地化'], near: ['字幕', '双语', '语种', '校对'], en: ['translat', 'i18n', 'locale', 'l10n', 'subtitle', 'patch', 'chinese'] },
+      { id: 'doc', label: '文档', core: ['文档', '办公', '排版'], near: ['合同', '简历', '公文', '模板'], en: ['docx', 'word', 'document', 'office', 'report', 'resume', 'cv', 'contract'] },
+      { id: 'sheet', label: '表格', core: ['表格', '数据表', '报表'], near: ['透视', '公式', '图表'], en: ['xlsx', 'excel', 'sheet', 'spreadsheet', 'csv', 'table', 'pivot', 'chart'] },
+      { id: 'slide', label: '演示', core: ['幻灯片', '演示'], near: ['汇报', '演讲稿'], en: ['pptx', 'ppt', 'slide', 'presentation', 'deck', 'keynote'] },
+      { id: 'pdf', label: 'PDF', core: ['扫描', '识别', '票据'], near: ['发票', '提取文字'], en: ['pdf', 'ocr', 'scan', 'tesseract', 'invoice', 'extract'] },
+      { id: 'image', label: '图片', core: ['图片', '图像', '生图', '绘图', '画图'], near: ['修图', '抠图', '放大', '去背景', '水印'], en: ['image', 'picture', 'photo', 'paint', 'draw', 'vision', 'stable-diffusion', 'upscale', 'background', 'matting'] },
+      { id: 'screenshot', label: '截图', core: ['截图', '录屏'], near: ['标注', '贴图', '抽帧'], en: ['screenshot', 'screen-capture', 'record', 'gif', 'snip', 'annotat'] },
+      { id: 'video', label: '视频', core: ['视频', '剪辑', '转码', '压制'], near: ['封面', '分镜', '字幕'], en: ['video', 'clip', 'edit', 'ffmpeg', 'transcode', 'render', 'subtitle', 'cover', 'frame'] },
+      { id: 'audio', label: '语音', core: ['语音', '朗读', '配音', '播报'], near: ['转写', '识别', '会议记录'], en: ['tts', 'voice', 'speech', 'narrat', 'transcri', 'whisper', 'asr'] },
+      { id: 'music', label: '音乐', core: ['音乐', '音频', '歌曲', '作曲'], near: ['歌词', '歌单', '混音'], en: ['music', 'audio', 'song', 'melody', 'lyric', 'playlist', 'midi'] },
+      { id: 'code', label: '代码', core: ['代码', '开发', '编程', '重构'], near: ['补全', '审查', '测试'], en: ['code', 'dev', 'refactor', 'lint', 'review', 'bug', 'complet', 'copilot'] },
+      { id: 'terminal', label: '终端', core: ['终端', '命令行', '脚本'], near: ['批处理', '自动化'], en: ['terminal', 'shell', 'cli', 'bash', 'powershell', 'command', 'script'] },
+      { id: 'git', label: 'Git', core: ['版本控制', '提交', '分支'], near: ['合并', '冲突', '仓库'], en: ['git', 'commit', 'branch', 'merge', 'rebase', 'repo', 'diff', 'pull-request'] },
+      { id: 'browser', label: '浏览器', core: ['浏览器', '网页', '登录'], near: ['自动化', '点击', '填表'], en: ['browser', 'web', 'html', 'scrap', 'automat', 'selenium', 'playwright', 'click', 'form'] },
+      { id: 'network', label: '网络', core: ['网络', '代理', '下载', '限速'], near: ['镜像', '端口'], en: ['network', 'proxy', 'download', 'vpn', 'dns', 'port', 'mirror', 'http'] },
+      { id: 'security', label: '安全', core: ['安全', '审计', '权限', '沙箱'], near: ['加密', '密钥', '脱敏', '漏洞'], en: ['security', 'audit', 'acl', 'sandbox', 'permission', 'encrypt', 'secret', 'cve', 'malware'] },
+      { id: 'usage', label: '用量', core: ['用量', '花费', '计费', '成本', '余额'], near: ['账单', '预算'], en: ['usage', 'token', 'ledger', 'cost', 'billing', 'quota', 'spend', 'price'] },
+      { id: 'model', label: '模型', core: ['模型', '接口', '密钥'], near: ['切换模型', '本地模型', '推理'], en: ['model', 'api', 'provider', 'llm', 'openai', 'ollama', 'local-model', 'inference', 'key'] },
+      { id: 'session', label: '会话', core: ['会话', '历史', '聊天记录'], near: ['导出', '搜索历史'], en: ['session', 'history', 'conversation', 'chat', 'log', 'export', 'archive'] },
+      { id: 'mail', label: '邮件', core: ['邮件', '邮箱', '收件箱'], near: ['发信', '订阅', '退订'], en: ['mail', 'email', 'inbox', 'smtp', 'imap', 'newsletter', 'subscri'] },
+      { id: 'calendar', label: '日程', core: ['日历', '日程', '会议'], near: ['时区', '待办'], en: ['calendar', 'schedule', 'meeting', 'remind', 'ical', 'timezone', 'event'] },
+      { id: 'clipboard', label: '剪贴板', core: ['剪贴板', '复制', '粘贴'], near: ['片段', '历史'], en: ['clipboard', 'copy', 'paste', 'snippet', 'history'] },
+      { id: 'database', label: '数据库', core: ['数据库', '查询'], near: ['备份', '迁移', '索引'], en: ['database', 'sql', 'query', 'backup', 'migrat', 'index', 'postgres', 'sqlite'] },
+      { id: 'deploy', label: '部署', core: ['部署', '发布', '构建'], near: ['容器', '流水线'], en: ['deploy', 'release', 'ci', 'build', 'docker', 'container', 'pipeline', 'github-actions'] },
+      { id: 'test', label: '测试', core: ['测试', '用例', '断言'], near: ['覆盖率', '回归'], en: ['test', 'unit', 'coverage', 'assert', 'e2e', 'bench'] },
+      { id: 'learn', label: '学习', core: ['学习', '教程', '刷题', '课程'], near: ['考试', '单词', '复习'], en: ['learn', 'tutorial', 'course', 'quiz', 'anki', 'flashcard', 'study', 'exam'] },
+      { id: 'money', label: '记账', core: ['记账', '财务', '账单', '支出'], near: ['预算', '发票', '报销'], en: ['finance', 'accounting', 'expense', 'budget', 'ledger', 'invoice', 'money'] },
+      { id: 'health', label: '健康', core: ['健康', '运动', '睡眠', '饮食'], near: ['体重', '步数', '体检'], en: ['health', 'fitness', 'sleep', 'diet', 'workout', 'weight', 'habit'] },
+      { id: 'game', label: '游戏', core: ['游戏', '引擎', '存档'], near: ['攻略', '像素'], en: ['game', 'godot', 'unity', 'mod', 'engine', 'pixel', 'save'] },
+      { id: 'reverse', label: '逆向', core: ['逆向', '反编译', '脱壳', '破解', '反汇编'], near: ['调试', '注入'], en: ['reverse', 'reverse-engineer', 'disassembl', 'decompil', 'ghidra', 'ida', 'binary', 'hook', 'inject', 'debug'] },
+      { id: 'crawl', label: '爬虫', core: ['爬虫', '抓取', '采集'], near: ['解析', '下载'], en: ['crawl', 'spider', 'scrap', 'crawler', 'parse', 'fetch'] },
+      { id: 'market', label: '市场', core: ['市场', '插件商店', '插件'], near: ['榜单', '推荐', '发现'], en: ['market', 'marketplace', 'registry', 'store', 'plugin', 'discover', 'rank'] },
+      { id: 'notify', label: '通知', core: ['通知', '提醒', '告警', '推送'], near: ['声音', '弹窗'], en: ['notify', 'notification', 'alert', 'push', 'remind', 'webhook', 'toast'] },
+      { id: 'hotkey', label: '快捷键', core: ['快捷键', '热键', '键盘'], near: ['鼠标', '手势'], en: ['hotkey', 'shortcut', 'keybind', 'keyboard', 'gesture'] },
+      { id: 'skill', label: '技能', core: ['技能', '工具集'], near: ['工作流', '自动化'], en: ['skill', 'toolkit', 'workflow', 'automat', 'agent-skill'] },
+      { id: 'prompt', label: '提示词', core: ['提示词', '模板'], near: ['系统提示'], en: ['prompt', 'system-prompt', 'few-shot', 'template', 'instruction'] },
+      { id: 'chart', label: '图表', core: ['统计', '可视化', '指标'], near: ['趋势', '报表'], en: ['chart', 'stat', 'visual', 'dashboard', 'metric', 'trend', 'plot'] },
+      { id: 'file', label: '文件', core: ['文件', '文件夹', '重命名', '整理'], near: ['去重', '分类', '备份'], en: ['file', 'folder', 'rename', 'organiz', 'dedup', 'sort', 'backup'] },
+    ];
+
+    /* 每组预编译一个正则，只为判断"这个中文词属于哪个场景" */
+    for (const g of LEXICON) {
+      g._re = new RegExp('(' + g.core.concat(g.near).join('|') + ')');
+    }
+
+    /* 这些英文词在任何描述里都可能出现（"read epub books on desktop" 里的 desktop），
+       权重压到最低，避免搜"壁纸"时命中的是一句 about 文本。 */
+    const GENERIC_EN = new Set(['desktop', 'web', 'html', 'ui', 'code', 'dev', 'game', 'file', 'script', 'index', 'key', 'model', 'data', 'tool', 'text', 'copy', 'search', 'api', 'cli', 'json', 'http']);
+
+    /** 把一个词扩成带权重的词组：原词 1.0，中文近义/衍生 0.6/0.45，英文前半 0.9、后半 0.55。
+        一个词可能同时落在多个场景组里（"书签"既是读书的衍生词，也是"书签收藏"的核心词），
+        落在核心词里的那组权重更高，这样搜"书签"时收藏类插件排在读书类前面。 */
+    function expandWeighted(token) {
+      const t = String(token == null ? '' : token).trim();
+      if (!t) return [];
+      const key = t.toLowerCase();
+      const out = [{ w: key, weight: 1 }];
+      const seen = {};
+      seen[key] = 1;
+      const push = (w, weight) => {
+        const k = String(w).toLowerCase();
+        if (!k || seen[k]) return;
+        seen[k] = 1;
+        out.push({ w: k, weight: GENERIC_EN.has(k) ? 0.25 : weight });
+      };
+      if (!/[\u4e00-\u9fa5]/.test(t)) return out;
+      let matched = 0;
+      for (const g of LEXICON) {
+        if (!g._re.test(t)) continue;
+        matched += 1;
+        const inCore = g.core.some((w) => t === w || t.indexOf(w) >= 0 || w.indexOf(t) >= 0);
+        /* 只是"沾边"的组降权，避免一次搜索把半个词表都拉进来 */
+        const scale = inCore ? 1 : 0.55;
+        for (const w of g.core) push(w, 0.6 * scale);
+        for (const w of g.near) push(w, 0.45 * scale);
+        const half = Math.ceil(g.en.length / 2);
+        g.en.forEach((w, i) => push(w, (i < half ? 0.9 : 0.55) * scale));
+      }
+      if (matched) return out;
+      /* 主表没命中时，退回老表（ZH_CONCEPTS），保证原有咨询行为不变 */
+      for (const row of ZH_CONCEPTS) {
+        if (!row[0].test(t)) continue;
+        for (const w of row[1]) push(w, 0.7);
+        break;
+      }
+      return out;
+    }
+
+    /* ───────────────────────── 搜索：状态 + 打分 ───────────────────────── */
+
+    /** 搜索词放在模块级，三个版式（普通/骨架/紧凑）共用同一个输入框内容 */
+    let searchQuery = '';
+    const searchListeners = new Set();
+
+    function setSearchQuery(v) {
+      const next = String(v == null ? '' : v);
+      if (next === searchQuery) return;
+      searchQuery = next;
+      searchListeners.forEach((fn) => {
+        try {
+          fn(next);
+        } catch (err) {
+          /* 某个订阅者挂了不影响别的 */
+        }
+      });
+    }
+
+    function useSearchQuery() {
+      const [v, setV] = useState(searchQuery);
+      useEffect(() => {
+        searchListeners.add(setV);
+        setV(searchQuery);
+        return () => searchListeners.delete(setV);
+      }, []);
+      return v;
+    }
+
+    /* ───────────────────────── 场景分类（"不知道搜什么"时的入口） ───────────────────────── */
+
+    /* 点卡片不是"输入一个词再扩展"，而是直接把这组词当搜索条件。
+       所以分类名不必是任何插件的描述词，也能搜到东西——这正是它比"猜关键词"强的地方。 */
+    const SCENE_PRIMARY = ['book', 'video', 'notes', 'doc', 'image', 'theme', 'wallpaper', 'search', 'memory', 'i18n', 'code', 'task'];
+
+    let sceneId = '';
+    const sceneListeners = new Set();
+
+    function setScene(id) {
+      const next = String(id || '');
+      if (next === sceneId) return;
+      sceneId = next;
+      sceneListeners.forEach((fn) => {
+        try {
+          fn(next);
+        } catch (err) {
+          /* 同上：单个订阅者出错不影响其他 */
+        }
+      });
+    }
+
+    function useScene() {
+      const [v, setV] = useState(sceneId);
+      useEffect(() => {
+        sceneListeners.add(setV);
+        setV(sceneId);
+        return () => sceneListeners.delete(setV);
+      }, []);
+      return v;
+    }
+
+    function sceneById(id) {
+      for (const g of LEXICON) if (g.id === id) return g;
+      return null;
+    }
+
+    /** 一组场景词 → [{w, weight}]：组名 1.0、核心 0.6、衍生 0.45、英文 0.9/0.55 */
+    function sceneTerms(g) {
+      if (!g) return [];
+      const out = [];
+      const seen = {};
+      const push = (w, weight) => {
+        const k = String(w).toLowerCase();
+        if (!k || seen[k]) return;
+        seen[k] = 1;
+        out.push({ w: k, weight: GENERIC_EN.has(k) ? 0.25 : weight });
+      };
+      push(g.label, 1);
+      for (const w of g.core) push(w, 0.6);
+      for (const w of g.near) push(w, 0.45);
+      const half = Math.ceil(g.en.length / 2);
+      g.en.forEach((w, i) => push(w, i < half ? 0.9 : 0.55));
+      return out;
+    }
+
+    /** 查询 → 去重后的 [{w, weight}]（同一个词命中多次取最高权重） */
+    function searchTerms(q) {
+      const toks = queryTokens(q);
+      if (!toks.length) return [];
+      const map = new Map();
+      for (const t of toks) {
+        for (const it of expandWeighted(t)) {
+          const k = String(it.w).toLowerCase();
+          const prev = map.get(k);
+          if (!prev || prev.weight < it.weight) map.set(k, { w: it.w, weight: it.weight });
+        }
+      }
+      return Array.from(map.values());
+    }
+
+    /** 一行仓库对一组词的得分：命中词累加，命中两个以上给加成，再加星数（对数，封顶 80） */
+    function matchScore(row, terms) {
+      let total = 0;
+      let hits = 0;
+      for (const it of terms) {
+        const s = scoreOne(row, it.w, it.weight);
+        if (s > 0) {
+          total += s;
+          hits += 1;
+        }
+      }
+      if (!hits) return 0;
+      return total + (hits > 1 ? 150 : 0) + Math.min(80, Math.log(Math.max(1, row.stars || 0)) * 6);
+    }
+
+    /* 低于这个分不算命中：否则只靠一个通用词（desktop/web）或星数加成也能挤进来 */
+    const SEARCH_MIN_SCORE = 150;
+
+    function applySearch(rows, terms, limit) {
+      const list = Array.isArray(rows) ? rows : [];
+      if (!terms.length) return list;
+      const scored = [];
+      for (const r of list) {
+        const s = matchScore(r, terms);
+        if (s >= SEARCH_MIN_SCORE) scored.push({ r, s });
+      }
+      scored.sort((a, b) => b.s - a.s || (b.r.stars || 0) - (a.r.stars || 0));
+      return scored.slice(0, limit || 30).map((x) => x.r);
+    }
+
+    /* ───────────────────────── 全站搜索（宿主替我们打 GitHub） ───────────────────────── */
+
+    /* 为什么不在浏览器直接打 api.github.com：
+       1) 跨域 + 未登录 60 次/小时的 IP 级限流，浏览器里没法带令牌；
+       2) 宿主那边本来就有 GH_HEADERS 和磁盘缓存，同一套凭证两处通用。
+       所以前端只负责"把中文翻成英文词"，请求交给宿主。*/
+    const SEARCH_URL = '/api/daily-consult.search';
+    const REMOTE_TTL_MS = 5 * 60 * 1000;
+    const remoteSearchCache = new Map();
+
+    /** 只把能进 GitHub 查询的英文词送出去；中文词和 "desktop/ui" 这类通用词在这里就丢掉，
+        因为 OR 查询里每多一个通用词，就多一批不相干的仓库。*/
+    function englishTerms(terms) {
+      const scored = [];
+      for (const it of terms || []) {
+        const w = String((it && it.w) || it || '').trim().toLowerCase();
+        if (!/^[a-z0-9][a-z0-9+.#-]{1,24}$/.test(w)) continue;
+        if (GENERIC_EN.has(w)) continue;
+        if (scored.some((x) => x.w === w)) continue;
+        scored.push({ w, weight: Number((it && it.weight) || 0) });
+      }
+      scored.sort((a, b) => b.weight - a.weight);
+      return scored.slice(0, 6).map((x) => x.w);
+    }
+
+    function useRemoteSearch(q, sc) {
+      const [st, setSt] = useState({ status: 'idle', items: [], total: 0, error: null, rate: null, q: '' });
+      const termKey = useMemo(() => {
+        const g = sceneById(sc);
+        return englishTerms(g ? sceneTerms(g) : searchTerms(q)).join(',');
+      }, [q, sc]);
+      const text = String(q || '').trim();
+      const active = !!termKey && (!!sc || text.length > 0);
+      const cacheKey = (sc ? 'scene:' + sc : 'q:' + text.toLowerCase()) + '|' + termKey;
+
+      useEffect(() => {
+        if (!active) {
+          setSt({ status: 'idle', items: [], total: 0, error: null, rate: null, q: '' });
+          return undefined;
+        }
+        const hit = remoteSearchCache.get(cacheKey);
+        if (hit && Date.now() - hit.at < REMOTE_TTL_MS) {
+          setSt(Object.assign({}, hit.payload, { status: 'ready' }));
+          return undefined;
+        }
+        let alive = true;
+        /* 600ms 防抖：中文输入法里每敲一个字母都会变，不留这个间隔会打出十几次请求 */
+        const timer = setTimeout(() => {
+          setSt((s) => Object.assign({}, s, { status: 'loading', error: null }));
+          fetch(SEARCH_URL + '?q=' + encodeURIComponent(text) + '&terms=' + encodeURIComponent(termKey))
+            .then((r) => r.json())
+            .then((j) => {
+              if (!alive) return;
+              if (!j || j.ok === false) {
+                setSt({
+                  status: 'error',
+                  items: [],
+                  total: 0,
+                  error: (j && j.error) || 'fail',
+                  rate: (j && j.rate) || null,
+                  q: (j && j.q) || '',
+                });
+                return;
+              }
+              /* 宿主返回的是原始 GitHub 结果，这里还要过一道"像不像插件" */
+              const items = (j.items || [])
+                .map(denseRow)
+                .filter(Boolean)
+                .filter((r) => looksLikeDshPlugin(r));
+              const payload = { items, total: j.total || items.length, rate: j.rate || null, q: j.q || '' };
+              remoteSearchCache.set(cacheKey, { at: Date.now(), payload });
+              setSt(Object.assign({ status: 'ready', error: null }, payload));
+            })
+            .catch(() => {
+              if (alive) setSt({ status: 'error', items: [], total: 0, error: 'network', rate: null, q: '' });
+            });
+        }, 600);
+        return () => {
+          alive = false;
+          clearTimeout(timer);
+        };
+      }, [active, cacheKey, termKey, text]);
+
+      return st;
+    }
+
+    /** 全站搜索的空态文案：把"为什么没结果"说清楚，而不是只说"没搜到" */
+    function remoteEmptyText(rs) {
+      if (rs.status === 'loading') return '正在搜 GitHub…';
+      if (rs.status === 'error') {
+        if (rs.error === 'rate_limited') {
+          const mins =
+            rs.rate && rs.rate.resetAt ? Math.max(1, Math.ceil((rs.rate.resetAt - Date.now()) / 60000)) : null;
+          return (
+            'GitHub 搜索限流了' +
+            (mins ? '，约 ' + mins + ' 分钟后再试' : '，稍后再试') +
+            (rs.rate && rs.rate.hasToken === false ? '（配 GITHUB_TOKEN 可提高额度）' : '')
+          );
+        }
+        if (rs.error === 'no_terms') return '这个词没有对应的英文关键词，换一个词，或者点上面的分类。';
+        if (rs.error === 'network') return '连不上 GitHub。';
+        return '搜索失败（' + rs.error + '）。';
+      }
+      if (rs.status === 'idle') return '输入一个字或点一个分类就会搜全站。';
+      return '全站没搜到。换个说法试试，或者点上面的分类。';
+    }
+
+    /* ───────────────────────── 数据源：GitHub / ∩ / npm ───────────────────────── */
+    /* 两个源的东西不一样：GitHub 有星数和提交时间，npm 有版本、发布日期和搜索打分。
+       所以不做合并，而是标题旁边一个 G/∩/N 开关，整个面板换一套数据看。
+       ∩ 是第三种看法：拿 GitHub 星数采样（默认前 300）和 npm 243 条对照，
+       分「只在 GitHub / 两边都有 / 只在 npm」三列——两边口径不同，比例本来就悬殊。 */
+    const NPM_URL = '/api/daily-consult.npm';
+    const NPM_TTL_MS = 5 * 60 * 1000;
+    const npmStore = new Map();
+    const SRC_KEY = 'dsh-daily-push:source';
+    const SRC_ORDER = ['gh', 'both', 'npm'];
+
+    let srcMode = 'gh';
+    try {
+      const saved = window.localStorage.getItem(SRC_KEY);
+      if (saved === 'npm' || saved === 'gh' || saved === 'both') srcMode = saved;
+    } catch (err) {
+      srcMode = 'gh';
+    }
+    const srcListeners = new Set();
+    function setSource(v) {
+      srcMode = v === 'npm' || v === 'both' ? v : 'gh';
+      try {
+        window.localStorage.setItem(SRC_KEY, srcMode);
+      } catch (err) {
+        /* 存不了就只在内存里切 */
+      }
+      srcListeners.forEach((fn) => fn(srcMode));
+    }
+    function nextSource(v) {
+      const i = SRC_ORDER.indexOf(v);
+      if (i < 0) return 'gh';
+      return SRC_ORDER[(i + 1) % SRC_ORDER.length];
+    }
+    function useSource() {
+      const [v, setV] = useState(srcMode);
+      useEffect(() => {
+        const fn = (x) => setV(x);
+        srcListeners.add(fn);
+        setV(srcMode);
+        return () => srcListeners.delete(fn);
+      }, []);
+      return v;
+    }
+
+    /* GitHub 星数采样：∩ 屏的左边数据，宿主取 3 页（300 条）并缓存 6 小时。 */
+    const GH_TOP_URL = '/api/daily-consult.ghtop?pages=3';
+    const GH_TOP_TTL_MS = 5 * 60 * 1000;
+    const ghTopStore = new Map();
+    function useGhTop(reloadKey, active) {
+      const [st, setSt] = useState({ status: 'loading', items: [], error: null, pages: 0 });
+      useEffect(() => {
+        if (!active) return undefined;
+        const hit = ghTopStore.get('top');
+        if (!reloadKey && hit && Date.now() - hit.at < GH_TOP_TTL_MS) {
+          setSt({ status: 'ready', items: hit.items, error: null, pages: hit.pages });
+          return undefined;
+        }
+        let alive = true;
+        setSt((s) => Object.assign({}, s, { status: s.items && s.items.length ? s.status : 'loading' }));
+        fetch(GH_TOP_URL)
+          .then((r) => r.json())
+          .then((j) => {
+            if (!alive) return;
+            if (!j || j.ok === false) {
+              setSt({ status: 'error', items: [], error: (j && j.error) || 'fail', pages: 0 });
+              return;
+            }
+            const items = j.items || [];
+            ghTopStore.set('top', { at: Date.now(), items, pages: j.pages || 0 });
+            setSt({ status: 'ready', items, error: null, pages: j.pages || 0 });
+          })
+          .catch(() => {
+            if (alive) setSt({ status: 'error', items: [], error: 'network', pages: 0 });
+          });
+        return () => {
+          alive = false;
+        };
+      }, [reloadKey, active]);
+      return st;
+    }
+
+    /* 先画后补：第一趟只拿 243 条元数据（约 2 秒），第二趟再补下载量（约 2~3 秒）。
+       两趟是分开的请求，所以列表不用等下载量就能画出来；「最常被用」那一列会先按相关度排，
+       下载量到了再自动跳成按下载排。 */
+    function useNpmSource(reloadKey, active) {
+      const [st, setSt] = useState({ status: 'loading', items: [], error: null, enriching: false });
+      useEffect(() => {
+        if (active === false) return undefined;
+        const hit = npmStore.get('all');
+        if (!reloadKey && hit && Date.now() - hit.at < NPM_TTL_MS) {
+          setSt({ status: 'ready', items: hit.items, error: null, enriching: !!hit.enriching });
+          return undefined;
+        }
+        let alive = true;
+        setSt((s) => Object.assign({}, s, { status: s.items && s.items.length ? s.status : 'loading' }));
+        fetch(NPM_URL)
+          .then((r) => r.json())
+          .then((j) => {
+            if (!alive) return;
+            if (!j || j.ok === false) {
+              setSt({ status: 'error', items: [], error: (j && j.error) || 'fail', enriching: false });
+              return;
+            }
+            const items = j.items || [];
+            const need = j.dlDone !== true;
+            npmStore.set('all', { at: Date.now(), items, enriching: need });
+            setSt({ status: 'ready', items, error: null, enriching: need });
+            if (!need) return undefined;
+            return fetch(NPM_URL + '?dl=1')
+              .then((r) => r.json())
+              .then((j2) => {
+                if (!alive || !j2 || j2.ok === false) return;
+                const full = j2.items || items;
+                npmStore.set('all', { at: Date.now(), items: full, enriching: false });
+                setSt({ status: 'ready', items: full, error: null, enriching: false });
+              })
+              .catch(() => {
+                if (alive) setSt((s) => Object.assign({}, s, { enriching: false }));
+              });
+          })
+          .catch(() => {
+            if (alive) setSt((s) => (s.items && s.items.length ? Object.assign({}, s, { enriching: false }) : { status: 'error', items: [], error: 'network', enriching: false }));
+          });
+        return () => {
+          alive = false;
+        };
+      }, [reloadKey, active]);
+      return st;
+    }
+
+    /** npm 没有星，排序只能靠它自己的打分：发布日期 / popularity / maintenance。
+     *  搜索时三层都先按词筛一遍，保留"这个包确实跟词有关"的行。 */
+    function npmFilter(rows, terms) {
+      if (!terms || !terms.length) return rows || [];
+      return (rows || []).filter((r) => matchScore(r, terms) >= 0.35);
+    }
+
+    /** 排序用三个真信号：发布日期、本周下载量（宿主批量取的）、npm 自己的相关度打分。
+     *  npm 搜索返回的 score.detail 在这一批里恒等于 1，所以不能用它排序。 */
+    function npmBuckets(items, terms) {
+      const hit = npmFilter(items, terms);
+      const by = (fn) => hit.slice().sort(fn).slice(0, 15);
+      const dl = (p) => Number(p && p.downloads) || 0;
+      const rel = (p) => Number(p && p.relevance) || 0;
+      const anyDl = hit.some((p) => dl(p) > 0);
+      return {
+        total: hit.length,
+        date: by((a, b) => String(b.date || '').localeCompare(String(a.date || ''))),
+        /* 下载量取不到（接口 429）时退回相关度，至少还有顺序 */
+        hot: by(anyDl ? (a, b) => dl(b) - dl(a) : (a, b) => rel(b) - rel(a)),
+        kept: by((a, b) => rel(b) - rel(a)),
+      };
+    }
+
+    /** 下载量：114046 → 114k，几千的显示 7.7k。 */
+    function npmNum(n) {
+      const v = Number(n) || 0;
+      if (v <= 0) return '—';
+      if (v >= 10000) return Math.round(v / 1000) + 'k';
+      if (v >= 1000) return (v / 1000).toFixed(1) + 'k';
+      return String(v);
+    }
+
+    /** owner/repo 归一：npm 行没有仓库地址时只有包名，这种永远进不了"两边都有"。 */
+    function repoKeyOf(name) {
+      const s = String(name || '').trim().toLowerCase();
+      return s.includes('/') ? s : '';
+    }
+
+    /** ∩：GitHub 星数采样（gh）与 npm 名单（np）对照，分三桶。
+     *  注意这不是"全量交集"——gh 只是按星数的前 N 条，npm 只是关键词命中的那批，
+     *  所以"只在 GitHub"= 没在 npm 名单里，"只在 npm"= 仓库没进星数采样（或压根没仓库）。 */
+    function intersectBuckets(ghItems, npmItems, terms, limit) {
+      const cap = limit || 15;
+      const gh = Array.isArray(ghItems) ? ghItems : [];
+      const np = Array.isArray(npmItems) ? npmItems : [];
+      const t = Array.isArray(terms) && terms.length ? terms : null;
+
+      let ghRows = gh.map((r) => denseRow(r)).filter(Boolean);
+      /* topic:dsh-plugin 这个标签被滥用得厉害：按星排序的前几名是 morluto/rea(45万★) 这种
+         跟插件无关的仓库。先按"名字带 dsh / 描述提 deepseek harness"筛一道，
+         实测 300 条 → 179 条，否则"只在 GitHub"整列都是噪音。 */
+      ghRows = ghRows.filter((r) => looksLikeDshPlugin(r));
+      if (t) {
+        const keep = ghRows.filter((r) => matchScore(r, t) > 0);
+        if (keep.length) ghRows = keep;
+      }
+
+      const ghByKey = new Map();
+      for (const r of ghRows) {
+        const k = repoKeyOf(r.fullName);
+        if (k) ghByKey.set(k, r);
+      }
+
+      /* npm 行本身已经是 denseRow 形状（handleNpm 在宿主侧就映射过），再 denseRow 一次会丢 name */
+      const npmRows = np
+        .map((p) => (p && p.fullName && p.source === 'npm' ? p : denseRow(p) || p))
+        .filter((p) => p && p.fullName);
+      const kept = t ? npmRows.filter((p) => matchScore(p, t) >= 0.35) : npmRows;
+
+      const both = [];
+      const npmOnly = [];
+      for (const p of kept) {
+        const k = repoKeyOf(p.fullName);
+        const g = k ? ghByKey.get(k) : null;
+        if (g) {
+          both.push(
+            Object.assign({}, p, {
+              /* 两边都有：显示 npm 包名（可直接装），星数用 GitHub 的 */
+              name: p.name || '',
+              displayName: p.name || p.displayName,
+              fullName: p.fullName,
+              stars: g.stars || p.stars || 0,
+              pushedAt: g.pushedAt || p.pushedAt,
+              description: p.description || g.description,
+              source: 'both',
+            }),
+          );
+        } else {
+          npmOnly.push(p);
+        }
+      }
+
+      const bothKeys = new Set(both.map((p) => repoKeyOf(p.fullName)));
+      const ghOnly = ghRows.filter((r) => !bothKeys.has(repoKeyOf(r.fullName)));
+
+      const byStars = (a, b) => (b.stars || 0) - (a.stars || 0);
+      const byDate = (a, b) => String(b.date || b.pushedAt || '').localeCompare(String(a.date || a.pushedAt || ''));
+      const anyDl = npmOnly.some((p) => Number(p.downloads) > 0);
+      const byDl = (a, b) => (Number(b.downloads) || 0) - (Number(a.downloads) || 0);
+
+      return {
+        ghTotal: ghRows.length,
+        npmTotal: kept.length,
+        both: both.sort(byStars).slice(0, cap),
+        ghOnly: ghOnly.sort(byStars).slice(0, cap),
+        npmOnly: npmOnly.slice().sort(anyDl ? byDl : byDate).slice(0, cap),
+        bothCount: both.length,
+        ghOnlyCount: ghOnly.length,
+        npmOnlyCount: npmOnly.length,
+      };
+    }
+
+
+
+    /* ───────────────────────── 搜索框 ───────────────────────── */
+    /* 三个版式的配色差很多（深色/浅色/骨架），所以这里只用 currentColor 和半透明线，不写死颜色 */
+    const SB_WRAP = { display: 'flex', flexDirection: 'column', gap: 5, padding: '8px 12px 6px', borderBottom: '1px solid rgba(128,128,128,.28)', flex: '0 0 auto' };
+    const SB_ROW = { display: 'flex', alignItems: 'center', gap: 8, border: '1px solid rgba(128,128,128,.32)', borderRadius: 8, padding: '5px 9px', background: 'transparent' };
+    const SB_ICON = { fontSize: 14, opacity: 0.5, lineHeight: 1 };
+    const SB_INPUT = { flex: 1, border: 'none', outline: 'none', background: 'transparent', fontSize: 13, color: 'inherit', fontFamily: 'inherit' };
+    const SB_CLEAR = { border: 'none', background: 'transparent', cursor: 'pointer', fontSize: 16, lineHeight: 1, opacity: 0.6, color: 'inherit', padding: 0 };
+    const SB_CHIPS = { display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 6, fontSize: 11, opacity: 0.75 };
+    const SB_CHIP = { border: '1px solid rgba(128,128,128,.35)', background: 'transparent', color: 'inherit', borderRadius: 999, padding: '1px 8px', cursor: 'pointer', fontSize: 11, fontFamily: 'inherit', opacity: 0.9 };
+    const SB_HINT = { opacity: 0.6 };
+    const SB_CAT = { border: '1px solid rgba(128,128,128,.28)', background: 'transparent', color: 'inherit', borderRadius: 6, padding: '0 7px', cursor: 'pointer', fontSize: 11, fontFamily: 'inherit', lineHeight: '18px', opacity: 0.85 };
+    const SB_CAT_ON = { border: '1px solid rgba(128,128,128,.6)', background: 'rgba(128,128,128,.14)', color: 'inherit', borderRadius: 6, padding: '0 7px', cursor: 'pointer', fontSize: 11, fontFamily: 'inherit', lineHeight: '18px', fontWeight: 600 };
+    const SB_ALL = { border: 'none', background: 'transparent', color: 'inherit', cursor: 'pointer', fontSize: 11, fontFamily: 'inherit', opacity: 0.6, padding: 0 };
+    const SB_CATBOX = { display: 'flex', flexWrap: 'wrap', gap: 5, maxHeight: 104, overflowY: 'auto', paddingTop: 2 };
+
+    function SearchBar() {
+      const q = useSearchQuery();
+      const sc = useScene();
+      const terms = useMemo(() => searchTerms(q), [q]);
+      const own = q.trim().toLowerCase();
+      const chips = terms.filter((t) => String(t.w).toLowerCase() !== own).slice(0, 8);
+      const [openAll, setOpenAll] = useState(false);
+      const cur = sceneById(sc);
+      const primary = SCENE_PRIMARY.map(sceneById).filter(Boolean);
+      const catBtn = (g, isOn) =>
+        h(
+          'button',
+          {
+            key: g.id,
+            onClick: () => {
+              const next = isOn ? '' : g.id;
+              setSearchQuery('');
+              setScene(next);
+            },
+            style: isOn ? SB_CAT_ON : SB_CAT,
+            title: '这类插件：' + g.core.slice(0, 6).join('、'),
+          },
+          g.label,
+        );
+      return h(
+        'div',
+        { style: SB_WRAP },
+        h(
+          'div',
+          { style: SB_ROW },
+          h('span', { style: SB_ICON, 'aria-hidden': 'true' }, '⌕'),
+          h('input', {
+            value: q,
+            onChange: (e) => {
+              setScene('');
+              setSearchQuery(e.target.value);
+            },
+            placeholder: '搜插件：名字、用途、关键词…  试试「翻译」「壁纸」「书籍」',
+            spellCheck: false,
+            style: SB_INPUT,
+            'aria-label': '搜索插件',
+          }),
+          q
+            ? h('button', { onClick: () => setSearchQuery(''), style: SB_CLEAR, title: '清空' }, '×')
+            : null,
+        ),
+        /* 分类行：不知道搜什么的时候点这个，比自己猜关键词靠得住。
+           已经在打字了就把这行让出去——这时用户显然知道要找什么。 */
+        q.trim()
+          ? null
+          : h(
+              'div',
+              { style: SB_CHIPS },
+              cur
+                ? h(
+                    'span',
+                    null,
+                    '正在看 ',
+                    h('b', null, cur.label),
+                    h(
+                      'button',
+                      { onClick: () => setScene(''), style: SB_CLEAR, title: '取消分类', 'aria-label': '取消分类' },
+                      ' ×',
+                    ),
+                  )
+                : h('span', { style: SB_HINT }, '不知道怎么搜？'),
+              cur ? null : primary.map((g) => catBtn(g, false)),
+              cur
+                ? null
+                : h(
+                    'button',
+                    { onClick: () => setOpenAll(!openAll), style: SB_ALL, 'aria-expanded': openAll ? 'true' : 'false' },
+                    openAll ? '收起 ‹' : '全部分类 ›',
+                  ),
+            ),
+        openAll && !cur && !q.trim()
+          ? h(
+              'div',
+              { style: SB_CATBOX },
+              LEXICON.map((g) => catBtn(g, false)),
+            )
+          : null,
+        chips.length
+          ? h(
+              'div',
+              { style: SB_CHIPS },
+              h('span', null, '相关词'),
+              chips.map((t) =>
+                h(
+                  'button',
+                  { key: t.w, onClick: () => setSearchQuery(t.w), style: SB_CHIP, title: '按这个词再搜一次' },
+                  String(t.w),
+                ),
+              ),
+            )
+          : null,
+      );
     }
 
     /**
@@ -2488,14 +3251,24 @@ window.__ModuleLoader__.load({
       const [installed, setInstalled] = useState(null);
       const inflight = useRef({});
 
+      /* 搜索框内容（模块级共享，三个版式一起用） */
+      const sq = useSearchQuery();
+      const sc = useScene();
+      /* 分类优先于关键词：点卡片时输入框是空的，用这组词直接筛 */
+      const searchT = useMemo(() => {
+        const g = sceneById(sc);
+        return g ? sceneTerms(g) : searchTerms(sq);
+      }, [sq, sc]);
+
       const load = useCallback(async () => {
         setLoading(true);
         setError(null);
         let doc = null;
         try {
-          doc = await fetchJson(REGISTRY_URL, { cache: 'no-store' });
-          if (!doc || !Array.isArray(doc.plugins)) throw new Error('榜单数据结构异常');
-          setRegistry(doc);
+          const reg = await loadRegistry();
+          if (!reg || !reg.plugins.length) throw new Error('榜单数据结构异常');
+          doc = { plugins: reg.plugins };
+          setRegistry({ plugins: reg.plugins, meta: { generatedAt: reg.generatedAt } });
         } catch (err) {
           setError(err instanceof Error ? err.message : String(err));
         }
@@ -2768,19 +3541,20 @@ window.__ModuleLoader__.load({
         const lead = today[0] || pickNew(plugins)[0] || null;
         /* ── 三榜并列用的数据（版式 C）── */
         const pack = (r) => denseRow(r);
-        const regRows = plugins.map(pack).filter(Boolean);
+        const regRows = regRowsOf(registry);
         const liveRows = (githubRecent || []).map(pack).filter(Boolean).filter((r) => !isOfficialRepo(r.fullName));
         const leadersAll = (ghExtra.leaders || [])
           .map(pack)
           .filter(Boolean)
           .filter((r) => !isOfficialRepo(r.fullName));
         /* 官方：优先用宿主给的；宿主没给（限流/旧进程）就从三处数据里按组织名捞回来 */
-        const officialRows = (ghExtra.official || [])
-          .map(pack)
-          .filter(Boolean)
-          .concat((ghExtra.leaders || []).map(pack).filter(Boolean).filter((r) => isOfficialRepo(r.fullName)))
-          .concat(regRows.filter((r) => isOfficialRepo(r.fullName)))
-          .filter((r, i, arr) => arr.findIndex((x) => x.fullName === r.fullName) === i)
+        const officialRows = uniqByFullName(
+          (ghExtra.official || [])
+            .map(pack)
+            .filter(Boolean)
+            .concat((ghExtra.leaders || []).map(pack).filter(Boolean).filter((r) => isOfficialRepo(r.fullName)))
+            .concat(regRows.filter((r) => isOfficialRepo(r.fullName))),
+        )
           .sort((a, b) => (b.stars || 0) - (a.stars || 0))
           .slice(0, 4);
         const byTime = (key) =>
@@ -2802,13 +3576,13 @@ window.__ModuleLoader__.load({
         const actTop = liveRows.length
           ? byTime('pushedAt')
           : pickToday(plugins, tr.ref).map(pack).filter(Boolean).filter((r) => !isOfficialRepo(r.fullName)).slice(0, 15);
-        const others = leadersAll
-          .concat(regRows.filter((r) => !isOfficialRepo(r.fullName) && !looksLikeDshPlugin(r)))
+        const others = uniqByFullName(
+          leadersAll.concat(regRows.filter((r) => !isOfficialRepo(r.fullName) && !looksLikeDshPlugin(r))),
+        )
           .filter((r) => !looksLikeDshPlugin(r))
-          .filter((r, i, arr) => arr.findIndex((x) => x.fullName === r.fullName) === i)
           .sort((a, b) => (b.stars || 0) - (a.stars || 0))
           .slice(0, 9);
-        return {
+        const out = {
           today,
           fresh,
           rising,
@@ -2825,7 +3599,24 @@ window.__ModuleLoader__.load({
         others,
         official: officialRows,
         };
-      }, [registry, prevStars, ghFresh, ghToday, ghExtra]);
+        /* 有关键词时：所有榜都按相关度重排，只留命中的 */
+        if (searchT.length) {
+          out.starsTop = applySearch(out.starsTop, searchT, 30);
+          out.newTop = applySearch(out.newTop, searchT, 30);
+          out.actTop = applySearch(out.actTop, searchT, 30);
+          out.others = applySearch(out.others, searchT, 9);
+          out.official = applySearch(out.official, searchT, 4);
+          out.today = applySearch(out.today, searchT);
+          out.fresh = applySearch(out.fresh, searchT);
+          out.rising = applySearch(out.rising, searchT);
+          out.lead = out.today[0] || out.starsTop[0] || null;
+          out.searchHit = out.starsTop.length + out.newTop.length + out.actTop.length;
+        }
+        out.searching = searchT.length > 0;
+        out.searchTerms = searchT;
+        out.scene = sc;
+        return out;
+      }, [registry, prevStars, ghFresh, ghToday, ghExtra, searchT, sc]);
 
       const isInstalled = (p) => {
         if (!installed) return null;
@@ -2891,7 +3682,7 @@ window.__ModuleLoader__.load({
                   at: Date.now(),
                 };
                 introRef.current = next;
-                writeIntroCache(next);
+(next);
                 setIntroCache(next);
               });
             })
@@ -3567,7 +4358,37 @@ window.__ModuleLoader__.load({
       };
     }
 
+    /** 去重。原来用 `arr.findIndex(...)` 在 1.6 万条上做，等于平方级扫描——
+     *  面板一刷新就是上亿次比较，这才是"内存/CPU 突然顶上去"的主因之一。 */
+    function uniqByFullName(rows) {
+      const seen = new Set();
+      const out = [];
+      for (const r of rows || []) {
+        const k = r && r.fullName;
+        if (!k || seen.has(k)) continue;
+        seen.add(k);
+        out.push(r);
+      }
+      return out;
+    }
+
+    /** 1.6 万条 → 精简行只算一次。registry 对象是稳定的（只在加载时换），用 WeakMap 认它。 */
+    const regRowsCache = new WeakMap();
+    function regRowsOf(registry) {
+      if (!registry || !Array.isArray(registry.plugins)) return [];
+      const hit = regRowsCache.get(registry);
+      if (hit) return hit;
+      const rows = [];
+      for (const p of registry.plugins) {
+        const r = denseRow(p);
+        if (r) rows.push(r);
+      }
+      regRowsCache.set(registry, rows);
+      return rows;
+    }
+
     /** 「新」只看建库 30 天内；「热门」看星。两者可以同时为真，显示时以星数为先。 */
+
     const DENSE_NEW_DAYS = 30;
     function denseBadge(row) {
       if (row.stars >= 20000) return 'hot';
@@ -3592,6 +4413,13 @@ window.__ModuleLoader__.load({
   background:rgba(250,251,253,calc(.55 + var(--dsk-a)*.42));}
 .dsk-head{display:flex;align-items:baseline;gap:10px;padding:0 2px;flex:0 0 auto}
 .dsk-head h1{font-size:calc(15px*var(--dsk-fs));font-weight:700;letter-spacing:.02em;margin:0}
+.dsk-title{user-select:none;display:flex;align-items:baseline;gap:5px}
+.dsk-src{font-family:inherit;font-weight:500;font-size:.64em;letter-spacing:.06em;white-space:nowrap;display:inline-flex;align-items:baseline}
+.dsk-src i{font-style:normal;opacity:.35;padding:0 1px}
+.dsk-src b{font-weight:600;opacity:.35;transition:opacity .15s,background .15s;cursor:pointer;padding:0 3px;border-radius:4px}
+.dsk-src b:hover{opacity:.85;background:rgba(128,128,128,.14)}
+.dsk-src b.on{opacity:1;color:var(--dsk-acc);background:rgba(128,128,128,.10)}
+.dsk-src b.on:hover{background:rgba(128,128,128,.18)}
 .dsk-head .sub{font-size:calc(10.4px*var(--dsk-fs));color:var(--dsk-dim)}
 .dsk-head .sub b{color:#f2b263;font-weight:600}
 .dsk-head .tools{margin-left:auto;display:flex;gap:6px;align-items:center}
@@ -3617,6 +4445,7 @@ window.__ModuleLoader__.load({
 .dsk-off a b{font-size:calc(11.2px*var(--dsk-fs));font-weight:600}
 .dsk-off a i{font-style:normal;font-size:calc(9.8px*var(--dsk-fs));color:var(--dsk-dim)}
 .dsk-main{flex:1;min-height:0;display:grid;grid-template-columns:1fr 1fr 1fr 1.02fr;gap:6px}
+.dsk-main-search{grid-template-columns:1.3fr 1fr 1.02fr}
 .dsk-col{display:flex;flex-direction:column;min-height:0;background:var(--dsk-card);
   border:1px solid var(--dsk-line);border-radius:8px;overflow:hidden}
 .dsk-ch{display:flex;align-items:baseline;gap:6px;padding:4px 9px 3px;flex:0 0 auto;
@@ -3641,6 +4470,9 @@ window.__ModuleLoader__.load({
 .dsk-row .x .warn{color:#e0a35c}
 .dsk-row .v{font-size:calc(9.5px*var(--dsk-fs));color:var(--dsk-dim);white-space:nowrap;padding-top:1px;font-variant-numeric:tabular-nums;display:flex;align-items:center;gap:5px}
 .dsk-star{border:0;background:transparent;color:var(--dsk-dim);cursor:pointer;font-size:calc(11px*var(--dsk-fs));line-height:1;padding:0 1px;opacity:.45;transition:opacity .12s,color .12s}
+.dsk-cp{border:0;background:transparent;color:var(--dsk-dim);cursor:pointer;font-size:calc(10px*var(--dsk-fs));line-height:1;padding:0 2px;opacity:.4;transition:opacity .12s,color .12s}
+.dsk-cp:hover{opacity:1;color:var(--dsk-acc)}
+.dsk-cp.on{opacity:1;color:var(--dsk-acc)}
 .dsk-row:hover .dsk-star{opacity:.9}
 .dsk-star:hover{color:#ffc861;opacity:1}
 .dsk-star.on{color:#ffc861;opacity:1}
@@ -3687,6 +4519,8 @@ window.__ModuleLoader__.load({
       const zhText = (props.zh && props.zh[p.fullName]) || '';
       const desc = zhText || p.description || '';
       const isWatch = !!(props.watched && props.watched[String(p.fullName).toLowerCase()]);
+      const cmd = installCmd(p);
+      const [copied, setCopied] = useState(false);
       return h(
         'a',
         { className: 'dsk-row', href: p.url, target: '_blank', rel: 'noreferrer', title: desc || p.fullName },
@@ -3697,7 +4531,7 @@ window.__ModuleLoader__.load({
           h(
             'span',
             { className: 't' },
-            h('b', null, p.fullName),
+            h('b', null, p.displayName || p.fullName),
             badge === 'hot' ? h('i', { className: 'dsk-b dsk-b-hot', title: denseBadgeTitle(p) }, '热门') : null,
             badge === 'new' ? h('i', { className: 'dsk-b dsk-b-new', title: denseBadgeTitle(p) }, '新') : null,
           ),
@@ -3718,6 +4552,21 @@ window.__ModuleLoader__.load({
           'span',
           { className: 'v' },
           props.metric,
+          h(
+            'button',
+            {
+              className: 'dsk-cp' + (copied ? ' on' : ''),
+              title: copied ? '已复制：' + cmd : '复制安装命令：' + cmd,
+              onClick: (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                copyText(cmd);
+                setCopied(true);
+                setTimeout(() => setCopied(false), 1200);
+              },
+            },
+            copied ? '✓' : '装',
+          ),
           h(
             'button',
             {
@@ -3802,6 +4651,11 @@ window.__ModuleLoader__.load({
     function DensePanel() {
       const d = useDailyData();
       const w = useWatch();
+      const sq = useSearchQuery();
+      const src = useSource();
+      const [npmReload, setNpmReload] = useState(0);
+      const npm = useNpmSource(src === 'gh' ? 0 : npmReload, true);
+      const ghTop = useGhTop(src === 'both' ? npmReload : 0, src === 'both');
       const [tab, setTab] = useState('today');
       const [prefs, setPrefs] = useState(() => readDensePrefs());
       const [showPrefs, setShowPrefs] = useState(false);
@@ -3818,6 +4672,31 @@ window.__ModuleLoader__.load({
 
       const stale = d.registry ? Math.round(daysBetween(d.registry.meta && d.registry.meta.generatedAt) || 0) : null;
       const v = d.view;
+      const npmTerms = useMemo(() => {
+        const g = sceneById(v.scene);
+        return g ? sceneTerms(g) : searchTerms(sq);
+      }, [sq, v.scene]);
+      const npmView = useMemo(() => npmBuckets(npm.items, npmTerms), [npm.items, npmTerms]);
+      /* ∩ 屏：GitHub 星数采样 × npm 名单，三桶（只在 G / 两边 / 只在 N） */
+      const ix = useMemo(
+        () => intersectBuckets(ghTop.items, npm.items, npmTerms),
+        [ghTop.items, npm.items, npmTerms],
+      );
+      /* 下载量接口会限流（429），取不到时 hot 列退回 npm 自己的相关度，kicker 也跟着变，别撒谎 */
+      const npmHasDl = useMemo(() => (npm.items || []).some((r) => Number(r.downloads) > 0), [npm.items]);
+      const rs = useRemoteSearch(sq, v.scene);
+      const localRows = useMemo(() => {
+        const seen = {};
+        const out = [];
+        for (const g of [v.starsTop, v.newTop, v.actTop]) {
+          for (const r of g || []) {
+            if (!r || !r.fullName || seen[r.fullName]) continue;
+            seen[r.fullName] = 1;
+            out.push(r);
+          }
+        }
+        return out.slice(0, 30);
+      }, [v]);
       const official = v.official || [];
       const others = v.others || [];
       const zhItems = useMemo(() => {
@@ -3877,24 +4756,107 @@ window.__ModuleLoader__.load({
         h(
           'div',
           { className: 'dsk-head' },
-          h('h1', null, '每日推送'),
           h(
-            'span',
-            { className: 'sub' },
-            '收录 ' + (v.total || '—') + ' 个旧榜单仓库 · 三榜各 15 · 官方已剔除 · ',
-            stale != null && stale > 2
-              ? h(
-                  'b',
-                  { title: '旧榜单文件（dsh-recommend）最后一次生成是 ' + stale + ' 天前，三榜数据取自 GitHub 实时搜索，不受影响' },
-                  '旧榜单快照 ' + stale + ' 天未更新（三榜为实时）',
-                )
-              : h('b', null, '榜单更新 ' + (stale == null ? '—' : stale + ' 天前')),
+            'h1',
+            { className: 'dsk-title', title: 'G 只看 GitHub · ∩ 两边对照 · N 只看 npm' },
+            '每日推送',
+            h(
+              'small',
+              { className: 'dsk-src' },
+              h(
+                'b',
+                {
+                  className: src === 'gh' ? 'on' : '',
+                  title: 'G：只看 GitHub',
+                  onClick: (e) => {
+                    e.stopPropagation();
+                    setSource('gh');
+                  },
+                },
+                'G',
+              ),
+              h('i', null, '/'),
+              h(
+                'b',
+                {
+                  className: src === 'both' ? 'on' : '',
+                  title: '∩：GitHub 与 npm 两边对照',
+                  onClick: (e) => {
+                    e.stopPropagation();
+                    setSource('both');
+                  },
+                },
+                '∩',
+              ),
+              h('i', null, '/'),
+              h(
+                'b',
+                {
+                  className: src === 'npm' ? 'on' : '',
+                  title: 'N：只看 npm',
+                  onClick: (e) => {
+                    e.stopPropagation();
+                    setSource('npm');
+                  },
+                },
+                'N',
+              ),
+            ),
           ),
+          src === 'npm'
+            ? h(
+                'span',
+                { className: 'sub' },
+                npm.status === 'loading'
+                  ? 'npm 数据取回中…'
+                  : npm.status === 'error'
+                    ? 'npm 取不到（' + npm.error + '）· 点刷新重试'
+                    : 'npm · 关键词 dsh-plugin · ' + npmView.total + ' 个包' +
+                      (npmTerms.length ? ' · 已按当前搜索筛过' : '') +
+                      (npm.enriching ? ' · 下载量补全中…' : ''),
+              )
+            : src === 'both'
+              ? h(
+                  'span',
+                  { className: 'sub' },
+                  ghTop.status === 'loading' || npm.status === 'loading'
+                    ? '正在对照两边…'
+                    : ghTop.status === 'error' || npm.status === 'error'
+                      ? '取不到（' + (ghTop.error || npm.error) + '）· 点刷新重试'
+                      : 'GitHub 前 ' + ix.ghTotal + '（按星）· npm ' + ix.npmTotal + ' · 两边都有 ' + ix.bothCount +
+                        (npmTerms.length ? ' · 已按当前搜索筛过' : ''),
+                )
+              : h(
+                'span',
+                { className: 'sub' },
+                v.searching
+                  ? (v.scene ? '分类「' + ((sceneById(v.scene) || {}).label || v.scene) + '」' : '搜索「' + sq.trim() + '」') +
+                    ' · 榜内 ' + (v.searchHit || 0) + ' · 全站 ' +
+                    (rs.status === 'ready' ? rs.items.length : rs.status === 'loading' ? '…' : '—')
+                  : '收录 ' + (v.total || '—') + ' 个旧榜单仓库 · 三榜各 15 · 官方已剔除 · ',
+                v.searching
+                  ? null
+                  : stale != null && stale > 2
+                    ? h(
+                        'b',
+                        { title: '旧榜单文件（dsh-recommend）最后一次生成是 ' + stale + ' 天前，三榜数据取自 GitHub 实时搜索，不受影响' },
+                        '旧榜单快照 ' + stale + ' 天未更新（三榜为实时）',
+                      )
+                    : h('b', null, '榜单更新 ' + (stale == null ? '—' : stale + ' 天前')),
+              ),
           h(
             'div',
             { className: 'tools' },
             h('span', { className: 'sub' }, stamp),
-            h('button', { className: 'dsk-btn', onClick: d.reload, disabled: d.loading }, d.loading ? '刷新中' : '刷新'),
+            h(
+              'button',
+              {
+                className: 'dsk-btn',
+                onClick: src === 'gh' ? d.reload : () => setNpmReload((x) => x + 1),
+                disabled: src === 'gh' ? d.loading : src === 'both' ? ghTop.status === 'loading' || npm.status === 'loading' : npm.status === 'loading',
+              },
+              (src === 'gh' ? d.loading : src === 'both' ? ghTop.status === 'loading' || npm.status === 'loading' : npm.status === 'loading') ? '刷新中' : '刷新',
+            ),
             h('button', { className: 'dsk-btn dsk-gear', title: '显示设置', onClick: () => setShowPrefs(!showPrefs) }, '⚙'),
           ),
         ),
@@ -3902,8 +4864,159 @@ window.__ModuleLoader__.load({
 
         d.error ? h('div', { className: 'ddp-fail' }, '榜单数据加载失败：' + d.error) : null,
 
-        tab === 'watch'
+        src === 'both'
+          ? h(
+              'div',
+              { className: 'dsk-main' },
+              h(DenseCol, {
+                title: '只在 GitHub',
+                kicker: 'github only',
+                rows: ix.ghOnly,
+                hint: String(ix.ghOnlyCount),
+                metric: (p) => fmtStars(p.stars),
+                zh,
+                watched: watchedMap,
+                onWatch: toggleWatch,
+                empty:
+                  ghTop.status === 'loading'
+                    ? '正在取 GitHub…'
+                    : ghTop.status === 'error'
+                      ? 'GitHub 取不到（' + ghTop.error + '）。点上面的刷新重试。'
+                      : '采样里没有只在 GitHub 的了。',
+              }),
+              h(DenseCol, {
+                title: '两边都有',
+                kicker: 'github ∩ npm',
+                rows: ix.both,
+                hint: String(ix.bothCount),
+                metric: (p) => fmtStars(p.stars),
+                zh,
+                watched: watchedMap,
+                onWatch: toggleWatch,
+                empty: npm.status === 'loading' || ghTop.status === 'loading' ? '正在对照…' : '这一批里没有两边都有的。',
+              }),
+              h(DenseCol, {
+                title: '只在 npm',
+                kicker: 'npm only',
+                rows: ix.npmOnly,
+                hint: String(ix.npmOnlyCount),
+                metric: (p) => npmNum(p.downloads),
+                zh,
+                watched: watchedMap,
+                onWatch: toggleWatch,
+                empty:
+                  npm.status === 'loading'
+                    ? '正在取 npm…'
+                    : npm.status === 'error'
+                      ? 'npm 取不到（' + npm.error + '）。点上面的刷新重试。'
+                      : 'npm 名单都落在 GitHub 采样里了。',
+              }),
+              h(
+                'div',
+                { className: 'dsk-side' },
+                h(AskPanel, { d }),
+                h('div', { className: 'dsk-watch' }, h(WatchList, { w })),
+              ),
+            )
+          : src === 'npm'
+          ? h(
+              'div',
+              { className: 'dsk-main' },
+              h(DenseCol, {
+                title: '最新发布',
+                kicker: 'by publish date',
+                rows: npmView.date,
+                hint: '15',
+                metric: (p) => agoShort(p.date),
+                zh,
+                watched: watchedMap,
+                onWatch: toggleWatch,
+                empty:
+                  npm.status === 'loading'
+                    ? '正在取 npm…'
+                    : npm.status === 'error'
+                      ? 'npm 取不到（' + npm.error + '）。点上面的刷新重试。'
+                      : '没有符合条件的包。',
+              }),
+              h(DenseCol, {
+                title: '最常被用',
+                kicker: npmHasDl ? 'by weekly downloads' : 'by npm relevance',
+                rows: npmView.hot,
+                hint: '15',
+                metric: (p) => (npmHasDl ? npmNum(p.downloads) : String(Math.round(Number(p.relevance) || 0))),
+                zh,
+                watched: watchedMap,
+                onWatch: toggleWatch,
+                empty:
+                  npm.status === 'loading'
+                    ? '正在取 npm…'
+                    : npm.status === 'error'
+                      ? 'npm 取不到（' + npm.error + '）。点上面的刷新重试。'
+                      : '没有符合条件的包。',
+              }),
+              h(DenseCol, {
+                title: 'npm 推荐',
+                kicker: 'by npm relevance',
+                rows: npmView.kept,
+                hint: '15',
+                metric: (p) => (p.relevance ? String(Math.round(p.relevance)) : '—'),
+                zh,
+                watched: watchedMap,
+                onWatch: toggleWatch,
+                empty:
+                  npm.status === 'loading'
+                    ? '正在取 npm…'
+                    : npm.status === 'error'
+                      ? 'npm 取不到（' + npm.error + '）。点上面的刷新重试。'
+                      : '没有符合条件的包。',
+              }),
+              h(
+                'div',
+                { className: 'dsk-side' },
+                h(AskPanel, { d }),
+                h('div', { className: 'dsk-watch' }, h(WatchList, { w })),
+              ),
+            )
+          : tab === 'watch'
           ? h(WatchPanel, { w })
+          : v.searching
+          ? h(
+              'div',
+              { className: 'dsk-main dsk-main-search' },
+              h(DenseCol, {
+                title: '全站搜索',
+                kicker:
+                  rs.status === 'loading'
+                    ? 'searching github…'
+                    : rs.status === 'error'
+                      ? 'failed'
+                      : 'github · topic:dsh-plugin',
+                rows: rs.items || [],
+                hint: String((rs.items || []).length),
+                metric: (p) => '★' + fmtStars(p.stars),
+                zh,
+                watched: watchedMap,
+                onWatch: toggleWatch,
+                empty: remoteEmptyText(rs),
+              }),
+              h(DenseCol, {
+                title: '榜内命中',
+                kicker: 'already loaded',
+                rows: localRows,
+                hint: String(localRows.length),
+                metric: (p) => '★' + fmtStars(p.stars),
+                zh,
+                watched: watchedMap,
+                onWatch: toggleWatch,
+                empty: '已加载的榜里没有，左边是全站的。',
+              }),
+              h(
+                'div',
+                { className: 'dsk-side' },
+                h(AskPanel, { d }),
+                h('div', { className: 'dsk-watch' }, h(WatchList, { w })),
+              ),
+            )
           : h(
               'div',
               { className: 'dsk-main' },
@@ -3916,7 +5029,7 @@ window.__ModuleLoader__.load({
                 zh,
                 watched: watchedMap,
                 onWatch: toggleWatch,
-                empty: d.loading ? '正在取数据…' : '还没有数据。',
+                empty: v.searching ? '没搜到相关插件。' : d.loading ? '正在取数据…' : '还没有数据。',
               }),
               h(DenseCol, {
                 title: '新建榜',
@@ -3927,7 +5040,7 @@ window.__ModuleLoader__.load({
                 zh,
                 watched: watchedMap,
                 onWatch: toggleWatch,
-                empty: d.loading ? '正在取数据…' : '这一窗里没有新仓库。',
+                empty: v.searching ? '没搜到相关插件。' : d.loading ? '正在取数据…' : '这一窗里没有新仓库。',
               }),
               h(DenseCol, {
                 title: '活跃榜',
@@ -3938,7 +5051,7 @@ window.__ModuleLoader__.load({
                 zh,
                 watched: watchedMap,
                 onWatch: toggleWatch,
-                empty: d.loading ? '正在取数据…' : '这一窗里没有刚提交的仓库。',
+                empty: v.searching ? '没搜到相关插件。' : d.loading ? '正在取数据…' : '这一窗里没有刚提交的仓库。',
               }),
               h(
                 'div',
@@ -4018,10 +5131,24 @@ window.__ModuleLoader__.load({
         h(
           'div',
           { className: 'dsk-foot' },
-          h('span', null, '数据 dsh-recommend + GitHub 实时'),
-          h('span', null, '星数榜已滤掉非插件'),
-          h('span', null, '官方只在顶部条，不进任何榜'),
-          h('span', null, '点任意一行打开仓库'),
+          v.searching
+            ? [
+                h('span', { key: 'a' }, 'GitHub 全站 · topic:dsh-plugin · 已滤非插件'),
+                h(
+                  'span',
+                  { key: 'b' },
+                  rs.rate && rs.rate.remaining != null
+                    ? '本次额度剩 ' + rs.rate.remaining + (rs.rate.hasToken ? '（带令牌）' : '（未登录，10 次/分）')
+                    : '未登录搜索 10 次/分',
+                ),
+                h('span', { key: 'c' }, '结果由宿主缓存 10 分钟'),
+              ]
+            : [
+                h('span', { key: 'a' }, '数据 dsh-recommend + GitHub 实时'),
+                h('span', { key: 'b' }, '星数榜已滤掉非插件'),
+                h('span', { key: 'c' }, '官方只在顶部条，不进任何榜'),
+                h('span', { key: 'd' }, '点任意一行打开仓库'),
+              ],
         ),
       );
     }
@@ -4037,15 +5164,29 @@ window.__ModuleLoader__.load({
     };
 
     /** 主区域面板：骨架阶段渲染三栏看板，否则渲染完整内容版。*/
+    /* 搜索框挂在最外层，三个版式（骨架 / 紧凑 / 普通）共用同一个输入框；
+       外层必须是 flex 列且 height:100%，否则 .dsk 这类 height:100% 的容器会塌成 0。 */
+    const PANEL_WRAP = { height: '100%', minHeight: 0, display: 'flex', flexDirection: 'column' };
+    const PANEL_BODY = { flex: '1 1 auto', minHeight: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' };
+
     const DailyPushPanel = () =>
-      DENSE_MODE
-        ? h(DensePanel)
-        : FRAME_MODE
-          ? h(FramePanel)
-          : h('div', { className: 'ddp-main' }, h(DailyPushTab));
+      h(
+        'div',
+        { style: PANEL_WRAP },
+        h(SearchBar),
+        h(
+          'div',
+          { style: PANEL_BODY },
+          DENSE_MODE
+            ? h(DensePanel)
+            : FRAME_MODE
+              ? h(FramePanel)
+              : h('div', { className: 'ddp-main' }, h(DailyPushTab)),
+        ),
+      );
 
     return {
-      __test: { zhIntro, cleanText, FramePanel, FrameB, WireBand, LeadBlock, ListBlock, AskPanel, WatchPanel, WatchList, useDailyData, buildConsultQuestion, scoreRepo, W_STAR, W_ACT, W_NEW, DensePanel, DenseCol, DenseRowView, denseRow, looksLikeDshPlugin },
+      __test: { zhIntro, cleanText, FramePanel, FrameB, WireBand, LeadBlock, ListBlock, AskPanel, WatchPanel, WatchList, useDailyData, buildConsultQuestion, scoreRepo, W_STAR, W_ACT, W_NEW, DensePanel, DenseCol, DenseRowView, denseRow, looksLikeDshPlugin, LEXICON, expandWeighted, searchTerms, matchScore, applySearch, SearchBar, setSearchQuery, getSearchQuery: () => searchQuery, SCENE_PRIMARY, sceneById, sceneTerms, setScene, getScene: () => sceneId, useRemoteSearch, englishTerms, remoteEmptyText, npmBuckets, npmFilter, npmNum, setSource, useSource, useNpmSource, getSource: () => srcMode, installCmd, trimRegistry, intersectBuckets, repoKeyOf, nextSource, useGhTop, GH_TOP_URL },
       inject: ['slots'],
       apply(ctx) {
         // 1) 左侧导航栏（和「任务看板」/「任务清单」同一排）：点它切到下面的主区域面板。

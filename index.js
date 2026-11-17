@@ -32,6 +32,9 @@ const ZH_SYSTEM = [
   '把营销语气去掉（强大、革命性、赋能之类），只讲它实际做什么；看不出来就照原文直译，不要编造功能。',
 ].join('\n');
 const RECENT_PATH = '/api/daily-consult.recent';
+const SEARCH_PATH = '/api/daily-consult.search';
+const NPM_PATH = '/api/daily-consult.npm';
+const GH_TOP_PATH = '/api/daily-consult.ghtop';
 
 const SYSTEM_PROMPT = [
   '你是 DeepSeek Harness（DSH）的插件顾问，回答要短、具体、能落地。',
@@ -698,6 +701,8 @@ const GH_HEADERS = (() => {
   if (token) h.authorization = 'Bearer ' + token;
   return h;
 })();
+/** 有没有配令牌直接决定搜索限流是 10 次/分（未登录）还是 30 次/分，前端要如实告诉用户。*/
+const GH_HAS_TOKEN = !!(process.env.GITHUB_TOKEN || process.env.DSH_GITHUB_TOKEN || process.env.GH_TOKEN);
 
 function watchFilePath() {
   const home = process.env.DSH_HOME || process.env.DSH_PROFILE_DIR || '.';
@@ -1192,6 +1197,446 @@ function memLog(tag, extra) {
   }
 }
 
+/* ─────────────────── 全站搜索：把中文关键词翻成 GitHub 查询 ─────────────────── */
+
+/* 关键词由前端按词表扩展好再传过来（terms），宿主只负责拼查询和缓存。
+   为什么不在这里扩词：词表在 client.js 里，宿主不重复维护一份。*/
+const SEARCH_TTL_MS = 10 * 60 * 1000;
+const SEARCH_CACHE_MAX = 60;
+const searchCache = new Map();
+
+/** 只留能进 GitHub 查询的英文词，最多 3 个。
+ *  两个实测结论：① GitHub 不认括号分组，`(a OR b) topic:x` 会被拆开，所以不加括号；
+ *  ② OR 的词越多越不准——6 个词时"书"的搜索结果会被 mobile 插件占满，3 个词时全是书。*/
+function buildSearchQuery(terms) {
+  const picked = [];
+  for (const t of terms || []) {
+    const w = String(t || '').trim().toLowerCase();
+    if (!/^[a-z0-9][a-z0-9+.#-]{1,24}$/.test(w)) continue;
+    if (picked.indexOf(w) >= 0) continue;
+    picked.push(w);
+    if (picked.length >= 3) break;
+  }
+  if (!picked.length) return '';
+  return picked.join(' OR ') + ' topic:dsh-plugin fork:false';
+}
+
+function searchCacheGet(key) {
+  const hit = searchCache.get(key);
+  if (!hit) return null;
+  if (Date.now() - hit.at > SEARCH_TTL_MS) {
+    searchCache.delete(key);
+    return null;
+  }
+  /* 命中就挪到队尾，天然按最近使用淘汰 */
+  searchCache.delete(key);
+  searchCache.set(key, hit);
+  return hit;
+}
+
+function searchCachePut(key, payload) {
+  searchCache.set(key, { at: Date.now(), payload });
+  while (searchCache.size > SEARCH_CACHE_MAX) {
+    const oldest = searchCache.keys().next().value;
+    searchCache.delete(oldest);
+  }
+}
+
+async function handleSearch(request) {
+  let u;
+  try {
+    u = new URL(request.url, 'http://local');
+  } catch (err) {
+    return jsonResponse({ ok: false, error: 'bad_url' }, 400);
+  }
+  const rawQ = String(u.searchParams.get('q') || '').trim().slice(0, 80);
+  const terms = String(u.searchParams.get('terms') || '')
+    .slice(0, 400)
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const q = buildSearchQuery(terms);
+  if (!q) return jsonResponse({ ok: false, error: 'no_terms', q: '' });
+
+  const key = rawQ.toLowerCase() + '|' + q;
+  const cached = searchCacheGet(key);
+  if (cached) return jsonResponse(Object.assign({}, cached.payload, { cached: true, ok: true }));
+
+  memLog('search ' + q);
+  const url =
+    'https://api.github.com/search/repositories?q=' + encodeURIComponent(q) + '&per_page=30';
+  let res;
+  try {
+    res = await fetch(url, { headers: GH_HEADERS });
+  } catch (err) {
+    return jsonResponse({ ok: false, error: 'network', detail: String((err && err.message) || err) });
+  }
+  const remain = parseInt(res.headers.get('x-ratelimit-remaining') || '', 10);
+  const reset = parseInt(res.headers.get('x-ratelimit-reset') || '', 10);
+  const rate = {
+    remaining: Number.isFinite(remain) ? remain : null,
+    resetAt: Number.isFinite(reset) ? reset * 1000 : null,
+    hasToken: GH_HAS_TOKEN,
+  };
+  if (!res.ok) {
+    const why = res.status === 403 || res.status === 429 ? 'rate_limited' : 'http_' + res.status;
+    return jsonResponse({ ok: false, error: why, rate, q });
+  }
+  let data;
+  try {
+    data = await res.json();
+  } catch (err) {
+    return jsonResponse({ ok: false, error: 'bad_json', rate, q });
+  }
+  const items = (data.items || []).map((it) => ({
+    fullName: it.full_name,
+    url: it.html_url,
+    description: it.description || '',
+    stars: it.stargazers_count || 0,
+    pushedAt: it.pushed_at || null,
+    createdAt: it.created_at || null,
+    topics: it.topics || [],
+    language: it.language || '',
+    archived: !!it.archived,
+    fork: !!it.fork,
+  }));
+  const payload = {
+    ok: true,
+    q,
+    total: data.total_count || items.length,
+    items,
+    rate,
+    fetchedAt: Date.now(),
+  };
+  searchCachePut(key, payload);
+  return jsonResponse(payload);
+}
+
+/* ─────────────────── npm 侧：只发了 npm 包的插件 ─────────────────── */
+
+/* npm 的搜索是模糊的：text=keywords:dsh-plugin 会把描述里出现 dsh 的包也塞进来，
+   所以拿回来之后还要按 keywords 再筛一遍，只留真打了标签的包。 */
+const NPM_TTL_MS = 10 * 60 * 1000;
+const NPM_CACHE_MAX = 12;
+const npmCache = new Map();
+
+/** 一个包算不算 DSH 插件：打了 dsh-plugin 标签，或者名字就是 dsh-xxx / @scope/dsh-xxx。 */
+function isNpmPlugin(p) {
+  const tags = (p && p.keywords ? p.keywords : []).map((k) => String(k).toLowerCase());
+  if (tags.indexOf('dsh-plugin') >= 0) return true;
+  if (tags.indexOf('deepseek-harness') >= 0) return true;
+  const name = String((p && p.name) || '');
+  return /^(?:@[^/]+\/)?dsh(?:[-.]|$)/i.test(name);
+}
+
+/** npm 的字段名跟 GitHub 不一样，这里统一成前端列表认的那一套；
+ *  stars 留 null，因为 npm 没有星数——前端看到 null 就不显示星。 */
+function npmRow(o) {
+  const p = (o && o.package) || {};
+  const links = p.links || {};
+  const detail = (o && o.score && o.score.detail) || {};
+  const name = String(p.name || '');
+  if (!name) return null;
+  const npmUrl = links.npm || 'https://www.npmjs.com/package/' + name;
+  /* 列表行用 owner/repo 当主键（「我关注的」也按这个存），没有仓库链接的才退回包名。
+     npm 的 repo 地址常带 git+ 前缀和 .git 尾巴，这里先洗干净再取 owner/repo。 */
+  const repoRaw = String(links.repository || '').replace(/^git\+/i, '').replace(/\.git$/i, '');
+  const repoMatch = /^https?:\/\/(?:www\.)?github\.com\/([^/]+)\/([^/#?]+)/i.exec(repoRaw);
+  const repoPath = repoMatch ? repoMatch[1] + '/' + repoMatch[2] : '';
+  return {
+    fullName: repoPath || name,
+    displayName: name,
+    name,
+    url: links.repository || npmUrl,
+    repoUrl: links.repository || '',
+    npmUrl,
+    description: p.description || '',
+    version: p.version || '',
+    date: p.date || '',
+    createdAt: p.date || '',
+    pushedAt: p.date || '',
+    stars: null,
+    source: 'npm',
+    relevance: Number((o && o.score && o.score.final) || 0),
+    downloads: 0,
+    score: {
+      popularity: Number(detail.popularity) || 0,
+      quality: Number(detail.quality) || 0,
+      maintenance: Number(detail.maintenance) || 0,
+    },
+  };
+}
+
+/* 下载量变化很慢，但接口会 429（Cloudflare 1015 限流）。
+   所以：内存缓存 10 分钟 → 磁盘缓存 6 小时 → 真去请求；请求失败就用旧的，绝不因为下载量把页面搞挂。 */
+const DL_TTL_MS = 6 * 60 * 60 * 1000;
+const dlCachePath = path.join(
+  process.env.DSH_HOME || path.join(process.env.USERPROFILE || process.env.HOME || '.', '.dsh'),
+  'cache',
+  'daily-push-npm-downloads.json',
+);
+let dlDisk = null;
+
+function readDlDisk() {
+  if (dlDisk) return dlDisk;
+  try {
+    const raw = JSON.parse(fs.readFileSync(dlCachePath, 'utf8'));
+    dlDisk = raw && raw.map && typeof raw.map === 'object' ? raw : { at: 0, map: {} };
+  } catch (err) {
+    dlDisk = { at: 0, map: {} };
+  }
+  return dlDisk;
+}
+
+function writeDlDisk(data) {
+  try {
+    fs.mkdirSync(path.dirname(dlCachePath), { recursive: true });
+    fs.writeFileSync(dlCachePath, JSON.stringify(data));
+  } catch (err) {
+    /* 写不进去就算了，下次重新取 */
+  }
+}
+
+async function fetchDownloads(names) {
+  const out = Object.create(null);
+  const disk = readDlDisk();
+  const fresh = Date.now() - disk.at < DL_TTL_MS;
+  const want = [];
+  for (const n of names) {
+    if (fresh && typeof disk.map[n] === 'number') out[n] = disk.map[n];
+    else want.push(n);
+  }
+  if (!want.length) return out;
+
+  const plain = want.filter((n) => String(n).charAt(0) !== '@');
+  const scoped = want.filter((n) => String(n).charAt(0) === '@').slice(0, 40);
+  let got = 0;
+
+  const one = async (url) => {
+    try {
+      const res = await fetch(url, { headers: { accept: 'application/json' } });
+      if (!res.ok) return null;
+      return await res.json();
+    } catch (err) {
+      return null;
+    }
+  };
+
+  for (let i = 0; i < plain.length; i += 128) {
+    const chunk = plain.slice(i, i + 128);
+    const data = await one('https://api.npmjs.org/downloads/point/last-week/' + chunk.map((n) => encodeURIComponent(n)).join(','));
+    for (const k of Object.keys(data || {})) {
+      out[k] = Number((data[k] && data[k].downloads) || 0) || 0;
+      got++;
+    }
+  }
+
+  /* 带 scope 的包只能一个个问，串行 40 个要十几秒，所以开 4 路并发（8 路更容易被限流）。 */
+  let cursor = 0;
+  const take = async () => {
+    while (cursor < scoped.length) {
+      const name = scoped[cursor++];
+      const data = await one('https://api.npmjs.org/downloads/point/last-week/' + encodeURIComponent(name));
+      if (data) {
+        out[name] = Number((data && data.downloads) || 0) || 0;
+        got++;
+      }
+    }
+  };
+  await Promise.all(new Array(Math.min(4, scoped.length)).fill(0).map(take));
+
+  if (got) {
+    const merged = Object.assign({}, readDlDisk().map, out);
+    dlDisk = { at: Date.now(), map: merged };
+    writeDlDisk(dlDisk);
+  }
+
+  /* 这次没取到的，用磁盘里的旧值兜底（可能过期，但比显示 0 好） */
+  for (const n of names) if (typeof out[n] !== 'number' && typeof disk.map[n] === 'number') out[n] = disk.map[n];
+  return out;
+}
+
+/* 先画后补：搜索一回来就把 243 条交给前端（约 2 秒），下载量随后再补。
+   一次给 243 个包取下载量要 6~7 秒（带 scope 的包只能一个个问），所以分两步：
+   - 不带 dl：只套用磁盘缓存里已存的值，绝不发请求 → 秒回
+   - 带 dl=1：只给"三列可能用到"的那批取（按日期、相关度各取前 60，去重后上限 120）
+   代价是第一次打开时「最常被用」那一列会先按相关度排，一两秒后跳到按下载量排。 */
+function dlTargets(items, cap) {
+  const byDate = items.slice().sort((a, b) => String(b.date || '').localeCompare(String(a.date || '')));
+  const byRel = items.slice().sort((a, b) => Number(b.relevance || 0) - Number(a.relevance || 0));
+  const out = [];
+  const seen = Object.create(null);
+  const half = Math.ceil(cap / 2);
+  const push = (r) => {
+    if (!r || out.length >= cap || seen[r.name]) return;
+    seen[r.name] = 1;
+    out.push(r.name);
+  };
+  for (const r of byDate.slice(0, half)) push(r);
+  for (const r of byRel) push(r);
+  return out;
+}
+
+function applyDiskDownloads(items) {
+  const disk = readDlDisk();
+  let missing = 0;
+  for (const r of items) {
+    const v = disk.map[r.name];
+    if (typeof v === 'number') r.downloads = v;
+    else if (!r.downloads) missing++;
+  }
+  return missing;
+}
+
+async function handleNpm(request) {
+  let u;
+  try {
+    u = new URL(request.url, 'http://local');
+  } catch (err) {
+    return jsonResponse({ ok: false, error: 'bad_url' }, 400);
+  }
+  const q = String(u.searchParams.get('q') || '').trim().slice(0, 60).toLowerCase();
+  const wantDl = u.searchParams.get('dl') === '1';
+  const key = q || '*';
+  const hit = npmCache.get(key);
+  const fresh = hit && Date.now() - hit.at < NPM_TTL_MS;
+  if (fresh) {
+    npmCache.delete(key);
+    npmCache.set(key, hit);
+    if (!wantDl || hit.payload.dlDone) {
+      return jsonResponse(Object.assign({}, hit.payload, { cached: true, ok: true }));
+    }
+    return finishNpm(hit.payload, true);
+  }
+
+  const text = q ? q + ' keywords:dsh-plugin' : 'keywords:dsh-plugin';
+  const url = 'https://registry.npmjs.org/-/v1/search?text=' + encodeURIComponent(text) + '&size=250';
+  memLog('npm ' + text);
+  let res;
+  try {
+    res = await fetch(url, { headers: { accept: 'application/json' } });
+  } catch (err) {
+    return jsonResponse({ ok: false, error: 'network', detail: String((err && err.message) || err) });
+  }
+  if (!res.ok) return jsonResponse({ ok: false, error: 'http_' + res.status });
+  let data;
+  try {
+    data = await res.json();
+  } catch (err) {
+    return jsonResponse({ ok: false, error: 'bad_json' });
+  }
+
+  const seen = Object.create(null);
+  const items = [];
+  for (const o of data.objects || []) {
+    const p = (o && o.package) || {};
+    if (!isNpmPlugin(p)) continue;
+    const row = npmRow(o);
+    if (!row || seen[row.fullName]) continue;
+    seen[row.fullName] = 1;
+    items.push(row);
+  }
+  items.sort((a, b) => String(b.date || '').localeCompare(String(a.date || '')));
+  const payload = {
+    ok: true,
+    source: 'npm',
+    q,
+    items,
+    total: items.length,
+    fetchedAt: Date.now(),
+    enriched: applyDiskDownloads(items) === 0,
+    dlDone: false,
+  };
+  npmCache.set(key, { at: Date.now(), payload });
+  while (npmCache.size > NPM_CACHE_MAX) npmCache.delete(npmCache.keys().next().value);
+  return wantDl ? finishNpm(payload) : jsonResponse(payload);
+}
+
+/* 第二步：真去取下载量（只取 dlTargets 挑出来的那批），取完把结果写回同一份 payload。
+   dlDone 表示"这一轮补全做过了"，避免前端每次挂载都再触发一次 5 秒的请求。 */
+async function finishNpm(payload) {
+  if (payload.dlDone) return jsonResponse(payload);
+  const map = await fetchDownloads(dlTargets(payload.items, 80));
+  for (const r of payload.items) {
+    if (typeof map[r.name] === 'number') r.downloads = map[r.name];
+  }
+  payload.enriched = applyDiskDownloads(payload.items) === 0;
+  payload.dlDone = true;
+  payload.dlCount = payload.items.filter((r) => Number(r.downloads) > 0).length;
+  payload.downloadsAt = Date.now();
+  return jsonResponse(payload);
+}
+
+/* ── GitHub 星数采样 ──
+   ∩ 屏要拿"GitHub 上有、npm 上也有"对照，得先有一份按星排的 GitHub 名单。
+   搜索接口单查询最多给 1000 条（10 页），这里默认取 3 页 = 300 条，6 小时缓存。 */
+const GH_TOP_TTL_MS = 6 * 60 * 60 * 1000;
+let ghTopCache = { at: 0, pages: 0, items: [] };
+
+async function handleGhTop(request) {
+  let u;
+  try {
+    u = new URL(request.url, 'http://local');
+  } catch (err) {
+    return jsonResponse({ ok: false, error: 'bad_request' });
+  }
+  const want = Math.max(1, Math.min(5, Number(u.searchParams.get('pages')) || 3));
+  const now = Date.now();
+  if (ghTopCache.items.length && ghTopCache.pages >= want && now - ghTopCache.at < GH_TOP_TTL_MS) {
+    return jsonResponse({
+      ok: true,
+      items: ghTopCache.items,
+      total: ghTopCache.items.length,
+      pages: ghTopCache.pages,
+      cached: true,
+    });
+  }
+
+  const seen = Object.create(null);
+  const items = [];
+  let err = null;
+  for (let p = 1; p <= want; p += 1) {
+    const url =
+      'https://api.github.com/search/repositories?q=' +
+      encodeURIComponent('topic:dsh-plugin fork:false') +
+      '&sort=stars&order=desc&per_page=100&page=' + p;
+    const rr = await getJsonQuiet(url);
+    if (!rr.ok) {
+      err = rr.status || rr.error || 'fail';
+      break;
+    }
+    const batch = (rr.data && rr.data.items) || [];
+    for (const it of batch) {
+      if (!it || !it.full_name || seen[it.full_name]) continue;
+      seen[it.full_name] = 1;
+      items.push({
+        fullName: it.full_name,
+        url: it.html_url,
+        description: it.description || '',
+        stars: it.stargazers_count || 0,
+        pushedAt: it.pushed_at,
+        createdAt: it.created_at,
+        topics: it.topics || [],
+        language: it.language || '',
+      });
+    }
+    if (batch.length < 100) break;
+  }
+
+  if (!items.length) return jsonResponse({ ok: false, items: [], error: err || 'fail', hasToken: GH_HAS_TOKEN });
+  if (!err) ghTopCache = { at: now, pages: want, items };
+  return jsonResponse({
+    ok: true,
+    items,
+    total: items.length,
+    pages: want,
+    degraded: !!err,
+    error: err,
+    hasToken: GH_HAS_TOKEN,
+    fetchedAt: now,
+  });
+}
+
 async function handleRecent() {
   const now = Date.now();
   if (recentCache.payload && now - recentCache.at < RECENT_TTL_MS) {
@@ -1334,6 +1779,39 @@ export function apply(ctx) {
           fetch: () => handleRecent(),
         }),
       'dsh-daily-push: recent search',
+    );
+
+    host.effect(
+      () =>
+        host.connection.fetch.register({
+          path: SEARCH_PATH,
+          methods: ['GET'],
+          requestBody: 'buffered',
+          fetch: (request) => handleSearch(request),
+        }),
+      'dsh-daily-push: keyword search',
+    );
+
+    host.effect(
+      () =>
+        host.connection.fetch.register({
+          path: NPM_PATH,
+          methods: ['GET'],
+          requestBody: 'buffered',
+          fetch: (request) => handleNpm(request),
+        }),
+      'dsh-daily-push: npm search',
+    );
+
+    host.effect(
+      () =>
+        host.connection.fetch.register({
+          path: GH_TOP_PATH,
+          methods: ['GET'],
+          requestBody: 'buffered',
+          fetch: (request) => handleGhTop(request),
+        }),
+      'dsh-daily-push: github top sample',
     );
     ctx.effect(
       () =>

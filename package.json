@@ -1,7 +1,7 @@
 {
   "name": "dsh-daily-push",
-  "version": "0.1.0",
-  "description": "每日推送：DSH 插件雷达。星数榜 / 新建榜 / 活跃榜三榜并列，官方仓库单独追踪，内置咨询（问某个插件值不值得装）、关注列表与已装插件更新提醒。",
+  "version": "0.1.1",
+  "description": "每日推送：DSH 插件雷达。三榜并列 + 中文搜索 + G/∩/N 三源对照（GitHub / 交集 / npm），每行一键复制安装命令。",
   "license": "MIT",
   "author": "dsh-daily-push contributors",
   "type": "module",
@@ -40,7 +40,7 @@
   },
   "meta": {
     "title": "每日推送",
-    "description": "三榜并列的 DSH 插件雷达：星数、新建、活跃各一榜，官方仓库单独追踪，可咨询、可关注。"
+    "description": "三榜并列的 DSH 插件雷达：星数 / 新建 / 活跃各一列，支持中文关键词搜索、场景分类、GitHub 与 npm 双源对照，内置咨询与关注。"
   },
   "icon": "./icon.svg",
   "dsh": {
