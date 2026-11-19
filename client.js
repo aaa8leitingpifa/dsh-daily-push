@@ -1905,7 +1905,7 @@ window.__ModuleLoader__.load({
         style.id = 'ddp-css';
         document.head.appendChild(style);
       }
-      style.textContent = CSS + REF_CSS + WATCH_CSS + BADGE_CSS + DENSE_CSS + ZH_CSS;
+      style.textContent = CSS + REF_CSS + WATCH_CSS + BADGE_CSS + DENSE_CSS + ZH_CSS + ALL_CSS;
     }
 
     const FRAME_MODE = (function () {
@@ -2674,6 +2674,408 @@ window.__ModuleLoader__.load({
         ghOnlyCount: ghOnly.length,
         npmOnlyCount: npmOnly.length,
       };
+    }
+
+    /* ═════════ 0.2.0 全量数据：GitHub 1000 + npm 2500，按 owner/repo 归一 ═════════
+       .all 一次给回两边全量（宿主磁盘缓存 6 小时），.all.dl 只补下载量。
+       全量数组只住在模块级 store 里；进 React 的永远是"这一屏该画的那几十行"。 */
+    const ALL_URL = '/api/daily-consult.all';
+    const ALL_DL_URL = '/api/daily-consult.all.dl';
+    const ALL_TTL_MS = 6 * 60 * 60 * 1000;
+    const A_STEP = 15;
+    const allStore = new Map();
+
+    function useAllData(reloadKey, active) {
+      const [st, setSt] = useState({ status: 'loading', gh: null, npm: null, fetchedAt: 0, hasToken: false, error: null });
+      useEffect(() => {
+        if (active === false) return undefined;
+        const hit = allStore.get('all');
+        if (!reloadKey && hit && Date.now() - hit.at < ALL_TTL_MS) {
+          setSt(Object.assign({}, hit.body, { status: 'ready' }));
+          return undefined;
+        }
+        let alive = true;
+        setSt((s) => Object.assign({}, s, { status: s.gh || s.npm ? 'ready' : 'loading' }));
+        fetch(ALL_URL + (reloadKey ? '?force=1' : ''))
+          .then((r) => r.json())
+          .then((j) => {
+            if (!alive) return;
+            if (!j || j.ok === false) {
+              setSt((s) => ({ status: 'error', gh: s.gh, npm: s.npm, fetchedAt: s.fetchedAt, hasToken: s.hasToken, error: (j && j.error) || 'fail' }));
+              return;
+            }
+            const body = {
+              gh: j.github || null,
+              npm: j.npm || null,
+              fetchedAt: Number(j.fetchedAt) || 0,
+              hasToken: !!j.hasToken,
+              error: null,
+            };
+            allStore.set('all', { at: Date.now(), body });
+            setSt(Object.assign({}, body, { status: 'ready' }));
+          })
+          .catch(() => {
+            if (alive) setSt((s) => ({ status: 'error', gh: s.gh, npm: s.npm, fetchedAt: s.fetchedAt, hasToken: s.hasToken, error: 'network' }));
+          });
+        return () => {
+          alive = false;
+        };
+      }, [reloadKey, active]);
+      return st;
+    }
+
+    /* 下载量只补一次（宿主最多查 700 个包）；补到了就按真实下载量排，没补到退回相关度。 */
+    const allDlStore = new Map();
+    function useAllDl(active, hasNpm) {
+      const [map, setMap] = useState(null);
+      useEffect(() => {
+        if (!active || !hasNpm) return undefined;
+        const hit = allDlStore.get('dl');
+        if (hit && Date.now() - hit.at < ALL_TTL_MS) {
+          setMap(hit.map);
+          return undefined;
+        }
+        let alive = true;
+        fetch(ALL_DL_URL)
+          .then((r) => r.json())
+          .then((j) => {
+            if (!alive || !j || j.ok === false) return;
+            const m = j.map || {};
+            allDlStore.set('dl', { at: Date.now(), map: m });
+            setMap(m);
+          })
+          .catch(() => {});
+        return () => {
+          alive = false;
+        };
+      }, [active, hasNpm]);
+      return map;
+    }
+
+    /** 归一键：GitHub 行是 owner/repo；npm 行优先用它映射到的仓库，没有仓库就只有包名（进不了「两边都有」）。 */
+    function allKeyOf(row) {
+      if (!row) return '';
+      const fn = String(row.fullName || '').trim().toLowerCase();
+      if (fn.includes('/')) return fn.replace(/\.git$/, '');
+      const m = String(row.repoUrl || '').match(/github\.com\/([^/]+)\/([^/?#]+)/i);
+      if (m) return (m[1] + '/' + m[2]).toLowerCase().replace(/\.git$/, '');
+      return '';
+    }
+
+    /** 全量合并屏的数据：两边按 owner/repo 归一，三桶各带角标 G / G∩N / N。
+     *  冲突时元数据（星数、更新时间、简介）取 GitHub，包名与安装命令取 npm。 */
+    function mergeAll(ghItems, npmItems, terms, opts) {
+      const t = Array.isArray(terms) && terms.length ? terms : null;
+      const dl = (opts && opts.dl) || null;
+      const ghRows = (Array.isArray(ghItems) ? ghItems : [])
+        .map((r) => denseRow(r))
+        .filter(Boolean)
+        .filter((r) => looksLikeDshPlugin(r));
+      const npmRows = (Array.isArray(npmItems) ? npmItems : [])
+        .map((p) => (p && p.fullName ? p : denseRow(p) || p))
+        .filter((p) => p && p.fullName);
+      const passGh = (r) => !t || matchScore(r, t) > 0;
+      const passNpm = (p) => !t || matchScore(p, t) >= 0.35;
+
+      const ghBy = new Map();
+      for (const r of ghRows) {
+        const k = allKeyOf(r);
+        if (k && !ghBy.has(k)) ghBy.set(k, r);
+      }
+
+      const both = [];
+      const npmOnly = [];
+      const npmKeys = new Set();
+      for (const p of npmRows) {
+        if (!passNpm(p)) continue;
+        const k = allKeyOf(p);
+        if (k) npmKeys.add(k);
+        const dls = Number((dl && dl[p.name]) || p.downloads) || 0;
+        const g = k ? ghBy.get(k) : null;
+        if (g) {
+          both.push(
+            Object.assign({}, g, {
+              name: p.name || '',
+              displayName: p.name || p.displayName || g.fullName,
+              npmUrl: p.npmUrl || '',
+              downloads: dls,
+              date: p.date || '',
+              relevance: p.relevance || 0,
+              description: p.description || g.description,
+              badge: 'G∩N',
+              source: 'both',
+            }),
+          );
+        } else {
+          /* npm 行没有 url：优先指回它的仓库，没有仓库就指 npm 包页 */
+          npmOnly.push(
+            Object.assign({}, p, {
+              url: p.repoUrl || p.npmUrl || (p.name ? 'https://www.npmjs.com/package/' + p.name : ''),
+              downloads: dls,
+              badge: 'N',
+            }),
+          );
+        }
+      }
+
+      const ghOnly = [];
+      for (const r of ghRows) {
+        const k = allKeyOf(r);
+        if (k && npmKeys.has(k)) continue;
+        if (!passGh(r)) continue;
+        ghOnly.push(Object.assign({}, r, { badge: 'G' }));
+      }
+
+      const byStars = (a, b) => (b.stars || 0) - (a.stars || 0);
+      const dlv = (p) => Number(p.downloads) || 0;
+      const anyDl = npmOnly.some((p) => dlv(p) > 0);
+      const byDl = (a, b) => dlv(b) - dlv(a);
+      const byDate = (a, b) => String(b.date || b.pushedAt || '').localeCompare(String(a.date || a.pushedAt || ''));
+      return {
+        ghTotal: ghRows.length,
+        npmTotal: npmRows.length,
+        both: both.sort(byStars),
+        ghOnly: ghOnly.sort(byStars),
+        npmOnly: npmOnly.sort(anyDl ? byDl : byDate),
+        bothCount: both.length,
+        ghOnlyCount: ghOnly.length,
+        npmOnlyCount: npmOnly.length,
+      };
+    }
+
+    /** 搜索先吃本地全量：合并后的三桶按匹配度排，命中就画，不用等远端。 */
+    function allHits(merged, terms, limit) {
+      const t = Array.isArray(terms) ? terms : [];
+      const rows = [].concat(
+        (merged && merged.both) || [],
+        (merged && merged.ghOnly) || [],
+        (merged && merged.npmOnly) || [],
+      );
+      if (!t.length) return rows.slice(0, limit || 60);
+      const scored = [];
+      for (const r of rows) {
+        const s = matchScore(r, t) || 0;
+        if (s > 0) scored.push({ r, s });
+      }
+      scored.sort((a, b) => b.s - a.s || (b.r.stars || 0) - (a.r.stars || 0));
+      return scored.slice(0, limit || 60).map((x) => x.r);
+    }
+
+    function hhmm(ts) {
+      const n = Number(ts) || 0;
+      if (!n) return '—';
+      const d = new Date(n > 1e12 ? n : n * 1000);
+      return (
+        String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0') + ' ' +
+        String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0')
+      );
+    }
+    function agoHours(at) {
+      const n = Number(at) || 0;
+      if (!n) return '';
+      const hrs = (Date.now() - n) / 3600000;
+      if (hrs < 1) return '刚刚';
+      if (hrs < 24) return Math.round(hrs) + ' 小时前';
+      return Math.round(hrs / 24) + ' 天前';
+    }
+    /** 「数据截至 11-19 14:30 · 6 小时前」——所有视图共用一句，口径统一。 */
+    function allStamp(at) {
+      const n = Number(at) || 0;
+      if (!n) return '';
+      return '数据截至 ' + hhmm(n) + ' · ' + agoHours(n);
+    }
+
+    const ALL_CSS = `
+.dsk-sb{font-style:normal;font-size:calc(8.4px*var(--dsk-fs));font-weight:700;letter-spacing:.04em;
+  padding:0 3px;margin-left:4px;border-radius:3px;border:1px solid currentColor;opacity:.5;vertical-align:1px}
+.dsk-row .t .dsk-sb{opacity:.62}
+.dsk-more{display:block;width:100%;margin:4px 0 2px;padding:3px 0;border:1px dashed rgba(128,128,128,.4);
+  border-radius:6px;background:transparent;color:inherit;font:inherit;font-size:calc(9.8px*var(--dsk-fs));
+  opacity:.7;cursor:pointer}
+.dsk-more:hover{opacity:1;background:rgba(128,128,128,.1)}
+.dsk-more-end{padding:3px 0 2px;text-align:center;font-size:calc(9px*var(--dsk-fs));color:var(--dsk-dim);opacity:.72}
+.dsk-token{margin:0 2px;padding:6px 8px;border:1px solid rgba(128,128,128,.26);border-radius:8px;
+  display:flex;flex-direction:column;gap:4px;background:rgba(128,128,128,.05)}
+.dsk-token .tk-h{display:flex;align-items:baseline;gap:8px;font-size:calc(10.4px*var(--dsk-fs))}
+.dsk-token .tk-h b{font-weight:600}
+.dsk-token .tk-s{opacity:.7;font-size:calc(9.4px*var(--dsk-fs))}
+.dsk-token .tk-h .dsk-btn{margin-left:auto}
+.dsk-token .tk-r{font-size:calc(9.2px*var(--dsk-fs));opacity:.62}
+.dsk-token .tk-in{display:flex;gap:6px;align-items:center}
+.dsk-token .tk-in input{flex:1;min-width:0;font:inherit;font-size:calc(10.2px*var(--dsk-fs));padding:2px 6px;
+  border:1px solid rgba(128,128,128,.35);border-radius:5px;background:transparent;color:inherit;outline:none}
+.dsk-token .tk-note{font-size:calc(9.4px*var(--dsk-fs));opacity:.8}
+`;
+
+    /** 「显示到第 n 条」的纯逻辑：一次 15 条，到底就 more=false、left=0。
+     *  数据一直在内存里，翻页只是改 n，不复制行、不重建索引。 */
+    function pageOf(rows, shown) {
+      const list = rows || [];
+      const n = Math.max(A_STEP, Math.min(Number(shown) || A_STEP, list.length));
+      return { vis: list.slice(0, n), left: Math.max(0, list.length - n), more: list.length > n };
+    }
+
+    /** 全量列：行都在内存里，但只画 shown 条；点一次 +15，到底明确说「没有更多了」。 */
+    function AllCol(props) {
+      const rows = props.rows || [];
+      const [shown, setShown] = useState(A_STEP);
+      useEffect(() => {
+        setShown(A_STEP);
+      }, [rows]);
+      const page = pageOf(rows, shown);
+      const vis = page.vis;
+      return h(
+        'section',
+        { className: 'dsk-col' },
+        h(
+          'div',
+          { className: 'dsk-ch' },
+          h('h2', null, props.title),
+          props.kicker ? h('span', { className: 'k' }, props.kicker) : null,
+          h('span', { className: 'c' }, props.hint || String(rows.length)),
+        ),
+        h(
+          'div',
+          { className: 'dsk-body' },
+          vis.length
+            ? vis.map((p, i) =>
+                h(DenseRowView, {
+                  key: String(p.fullName || p.name) + ':' + i,
+                  p,
+                  idx: i,
+                  metric: props.metric(p),
+                  zh: props.zh,
+                  watched: props.watched,
+                  onWatch: props.onWatch,
+                }),
+              )
+            : h('div', { className: 'dsk-empty' }, props.empty || '这一栏暂时没有内容。'),
+          vis.length
+            ? page.more
+              ? h('button', { className: 'dsk-more', onClick: () => setShown((n) => n + A_STEP) }, '再加载 ' + A_STEP + ' 条（还剩 ' + page.left + '）')
+              : h('div', { className: 'dsk-more-end' }, '没有更多了')
+            : null,
+        ),
+      );
+    }
+
+    /* ───────── ⚙ 里的 GitHub 令牌框：存宿主，前端只看「已配置/未配置」 ───────── */
+    const TOKEN_URL = '/api/daily-consult.token';
+    const TOKEN_ERR = {
+      bad_format: '格式不对：GitHub 令牌是 20 位以上的字母数字串（ghp_… / github_pat_…）',
+      bad_token: 'GitHub 不认这个令牌（401），可能已过期或被撤销',
+      network: '连不上 api.github.com，检查网络后再试',
+      fail: '宿主没有回话，稍后再试',
+    };
+
+    function TokenBox(props) {
+      const [st, setSt] = useState({ status: 'loading', configured: false, source: '', login: '', hint: '', env: false, rate: null });
+      const [val, setVal] = useState('');
+      const [note, setNote] = useState('');
+      const [busy, setBusy] = useState(false);
+      const [open, setOpen] = useState(false);
+
+      const absorb = (j, done) => {
+        if (!j) {
+          setNote(TOKEN_ERR.fail);
+          return false;
+        }
+        if (j.ok === false) {
+          setNote(TOKEN_ERR[j.error] || '失败：' + j.error);
+          return false;
+        }
+        const probe = j.probe && j.probe.ok ? j.probe : null;
+        setSt((s) => ({
+          status: 'ready',
+          configured: !!j.configured,
+          source: j.source || '',
+          login: j.login || (probe && probe.login) || '',
+          hint: j.hint || '',
+          env: !!j.env,
+          rate: j.rate || probe || s.rate,
+        }));
+        if (done) setNote(done);
+        return true;
+      };
+
+      const ask = (withRate) => {
+        fetch(TOKEN_URL + (withRate ? '?rate=1' : ''))
+          .then((r) => r.json())
+          .then((j) => absorb(j, ''))
+          .catch(() => setNote(TOKEN_ERR.network));
+      };
+
+      useEffect(() => {
+        ask(true);
+      }, []);
+
+      const post = (action) => {
+        setBusy(true);
+        setNote(action === 'save' ? '正在向 GitHub 校验…' : action === 'test' ? '正在校验…' : '');
+        fetch(TOKEN_URL, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ action, token: val.trim() }),
+        })
+          .then((r) => r.json())
+          .then((j) => {
+            setBusy(false);
+            const ok = absorb(
+              j,
+              action === 'save' ? '已保存；下次抓取带令牌（搜索 30 次/分，每个查询可翻到 1000 条）' : action === 'test' ? '令牌可用' : '已清除，回到未登录状态',
+            );
+            if (ok && action !== 'test') {
+              setVal('');
+              if (props.onChange) props.onChange(j);
+            }
+          })
+          .catch(() => {
+            setBusy(false);
+            setNote(TOKEN_ERR.network);
+          });
+      };
+
+      const rate = st.rate && st.rate.ok ? st.rate : null;
+      const who = st.configured
+        ? '已配置 · ' + (st.login || (st.hint ? '尾号 ' + st.hint : '令牌')) + (st.source === 'env' ? '（来自环境变量）' : '')
+        : '未配置';
+      return h(
+        'div',
+        { className: 'dsk-token' },
+        h(
+          'div',
+          { className: 'tk-h' },
+          h('b', null, 'GitHub 令牌'),
+          h('span', { className: 'tk-s' }, st.status === 'loading' ? '读取中…' : who),
+          h('button', { className: 'dsk-btn', onClick: () => setOpen(!open) }, open ? '收起' : st.configured ? '更换' : '填写'),
+        ),
+        h(
+          'div',
+          { className: 'tk-r' },
+          rate
+            ? '搜索额度剩 ' + rate.search.remaining + '/' + rate.search.limit + ' 次/分 · ' + hhmm(rate.search.resetAt) + ' 重置'
+            : st.configured
+              ? '额度查询中…'
+              : '未登录：搜索 10 次/分，每个查询最多只能拿到 1000 条里的前 400 条',
+        ),
+        open
+          ? h(
+              'div',
+              { className: 'tk-in' },
+              h('input', {
+                type: 'password',
+                value: val,
+                placeholder: 'ghp_… 或 github_pat_…',
+                spellCheck: false,
+                onChange: (e) => setVal(e.target.value),
+              }),
+              h('button', { className: 'dsk-btn', disabled: busy || !val.trim(), onClick: () => post('save') }, busy ? '…' : '保存'),
+              h('button', { className: 'dsk-btn', disabled: busy, onClick: () => post('test') }, '测试'),
+              st.configured ? h('button', { className: 'dsk-btn', disabled: busy, onClick: () => post('clear') }, '清除') : null,
+            )
+          : null,
+        note ? h('div', { className: 'tk-note' }, note) : null,
+      );
     }
 
 
@@ -4532,6 +4934,21 @@ window.__ModuleLoader__.load({
             'span',
             { className: 't' },
             h('b', null, p.displayName || p.fullName),
+            p.badge
+              ? h(
+                  'i',
+                  {
+                    className: 'dsk-sb',
+                    title:
+                      p.badge === 'G'
+                        ? '只在 GitHub：npm 上没有同名包'
+                        : p.badge === 'N'
+                          ? '只在 npm：仓库没进 GitHub 全量（或压根没写仓库地址）'
+                          : '两边都有：元数据取 GitHub，装的时候用 npm 包名',
+                  },
+                  p.badge,
+                )
+              : null,
             badge === 'hot' ? h('i', { className: 'dsk-b dsk-b-hot', title: denseBadgeTitle(p) }, '热门') : null,
             badge === 'new' ? h('i', { className: 'dsk-b dsk-b-new', title: denseBadgeTitle(p) }, '新') : null,
           ),
@@ -4654,8 +5071,9 @@ window.__ModuleLoader__.load({
       const sq = useSearchQuery();
       const src = useSource();
       const [npmReload, setNpmReload] = useState(0);
-      const npm = useNpmSource(src === 'gh' ? 0 : npmReload, true);
-      const ghTop = useGhTop(src === 'both' ? npmReload : 0, src === 'both');
+      /* ∩ 屏改用全量数据（.all）之后，npm 榜单只在 N 屏要，星数采样也不再需要单独拉 */
+      const npm = useNpmSource(src === 'npm' ? npmReload : 0, src === 'npm');
+      const ghTop = useGhTop(0, false);
       const [tab, setTab] = useState('today');
       const [prefs, setPrefs] = useState(() => readDensePrefs());
       const [showPrefs, setShowPrefs] = useState(false);
@@ -4678,10 +5096,19 @@ window.__ModuleLoader__.load({
       }, [sq, v.scene]);
       const npmView = useMemo(() => npmBuckets(npm.items, npmTerms), [npm.items, npmTerms]);
       /* ∩ 屏：GitHub 星数采样 × npm 名单，三桶（只在 G / 两边 / 只在 N） */
-      const ix = useMemo(
-        () => intersectBuckets(ghTop.items, npm.items, npmTerms),
-        [ghTop.items, npm.items, npmTerms],
+      /* 旧的星数采样 ∩ 三桶（GH_TOP_URL）留作兜底，0.2.0 的 ∩ 屏走合并后的全量 */
+      const ix = useMemo(() => intersectBuckets(ghTop.items, npm.items, npmTerms), [ghTop.items, npm.items, npmTerms]);
+      /* 0.2.0 全量屏：GitHub 1000 + npm 2500 一次拉回本地，三桶并列，行上带 G / G∩N / N 角标。
+         全量数组只在模块级 store 里，进 state 的只有合并后的三桶（也是引用，不复制）。 */
+      const [allReload, setAllReload] = useState(0);
+      const all = useAllData(allReload, true);
+      const dlMap = useAllDl(src === 'both' || v.searching, !!(all.npm && all.npm.items && all.npm.items.length));
+      const merged = useMemo(
+        () => mergeAll(all.gh && all.gh.items, all.npm && all.npm.items, npmTerms, { dl: dlMap }),
+        [all.gh, all.npm, npmTerms, dlMap],
       );
+      const hits = useMemo(() => allHits(merged, npmTerms, 90), [merged, npmTerms]);
+      const allBusy = all.status === 'loading' || all.status === 'error';
       /* 下载量接口会限流（429），取不到时 hot 列退回 npm 自己的相关度，kicker 也跟着变，别撒谎 */
       const npmHasDl = useMemo(() => (npm.items || []).some((r) => Number(r.downloads) > 0), [npm.items]);
       const rs = useRemoteSearch(sq, v.scene);
@@ -4819,12 +5246,12 @@ window.__ModuleLoader__.load({
               ? h(
                   'span',
                   { className: 'sub' },
-                  ghTop.status === 'loading' || npm.status === 'loading'
-                    ? '正在对照两边…'
-                    : ghTop.status === 'error' || npm.status === 'error'
-                      ? '取不到（' + (ghTop.error || npm.error) + '）· 点刷新重试'
-                      : 'GitHub 前 ' + ix.ghTotal + '（按星）· npm ' + ix.npmTotal + ' · 两边都有 ' + ix.bothCount +
-                        (npmTerms.length ? ' · 已按当前搜索筛过' : ''),
+                  all.status === 'loading' && !merged.ghTotal && !merged.npmTotal
+                    ? '正在取两边全量（首次约 10 秒）…'
+                    : 'GitHub ' + merged.ghTotal + ' · npm ' + merged.npmTotal + ' · 两边都有 ' + merged.bothCount +
+                      (npmTerms.length ? ' · 已按当前搜索筛过' : '') +
+                      (all.gh && all.gh.error ? ' · G 侧 ' + all.gh.error : '') +
+                      (all.npm && all.npm.error ? ' · N 侧 ' + all.npm.error : ''),
                 )
               : h(
                 'span',
@@ -4852,15 +5279,24 @@ window.__ModuleLoader__.load({
               'button',
               {
                 className: 'dsk-btn',
-                onClick: src === 'gh' ? d.reload : () => setNpmReload((x) => x + 1),
-                disabled: src === 'gh' ? d.loading : src === 'both' ? ghTop.status === 'loading' || npm.status === 'loading' : npm.status === 'loading',
+                onClick:
+                  src === 'gh'
+                    ? d.reload
+                    : src === 'both'
+                      ? () => {
+                          setNpmReload((x) => x + 1);
+                          setAllReload((x) => x + 1);
+                        }
+                      : () => setNpmReload((x) => x + 1),
+                disabled: src === 'gh' ? d.loading : src === 'both' ? all.status === 'loading' : npm.status === 'loading',
               },
-              (src === 'gh' ? d.loading : src === 'both' ? ghTop.status === 'loading' || npm.status === 'loading' : npm.status === 'loading') ? '刷新中' : '刷新',
+              (src === 'gh' ? d.loading : src === 'both' ? all.status === 'loading' : npm.status === 'loading') ? '刷新中' : '刷新',
             ),
             h('button', { className: 'dsk-btn dsk-gear', title: '显示设置', onClick: () => setShowPrefs(!showPrefs) }, '⚙'),
           ),
         ),
         showPrefs ? h(DensePrefs, { prefs, onChange: change }) : null,
+        showPrefs ? h(TokenBox, { onChange: () => setAllReload((x) => x + 1) }) : null,
 
         d.error ? h('div', { className: 'ddp-fail' }, '榜单数据加载失败：' + d.error) : null,
 
@@ -4868,48 +5304,55 @@ window.__ModuleLoader__.load({
           ? h(
               'div',
               { className: 'dsk-main' },
-              h(DenseCol, {
+              h(AllCol, {
                 title: '只在 GitHub',
-                kicker: 'github only',
-                rows: ix.ghOnly,
-                hint: String(ix.ghOnlyCount),
+                kicker: 'github only · G',
+                rows: merged.ghOnly,
+                hint: String(merged.ghOnlyCount),
                 metric: (p) => fmtStars(p.stars),
                 zh,
                 watched: watchedMap,
                 onWatch: toggleWatch,
                 empty:
-                  ghTop.status === 'loading'
-                    ? '正在取 GitHub…'
-                    : ghTop.status === 'error'
-                      ? 'GitHub 取不到（' + ghTop.error + '）。点上面的刷新重试。'
-                      : '采样里没有只在 GitHub 的了。',
+                  all.gh && all.gh.error && !merged.ghTotal
+                    ? 'GitHub 取不到（' + all.gh.error + '）。npm 那两列照常可用，点上面的刷新重试。'
+                    : allBusy
+                      ? '正在取 GitHub 全量…'
+                      : '全量里没有只在 GitHub 的了。',
               }),
-              h(DenseCol, {
+              h(AllCol, {
                 title: '两边都有',
                 kicker: 'github ∩ npm',
-                rows: ix.both,
-                hint: String(ix.bothCount),
+                rows: merged.both,
+                hint: String(merged.bothCount),
                 metric: (p) => fmtStars(p.stars),
                 zh,
                 watched: watchedMap,
                 onWatch: toggleWatch,
-                empty: npm.status === 'loading' || ghTop.status === 'loading' ? '正在对照…' : '这一批里没有两边都有的。',
+                empty:
+                  allBusy
+                    ? '正在对照两边…'
+                    : all.gh && all.gh.error
+                      ? 'GitHub 取不到（' + all.gh.error + '），没法对照。'
+                      : all.npm && all.npm.error
+                        ? 'npm 取不到（' + all.npm.error + '），没法对照。'
+                        : '这一批里没有两边都有的。',
               }),
-              h(DenseCol, {
+              h(AllCol, {
                 title: '只在 npm',
-                kicker: 'npm only',
-                rows: ix.npmOnly,
-                hint: String(ix.npmOnlyCount),
+                kicker: 'npm only · N',
+                rows: merged.npmOnly,
+                hint: String(merged.npmOnlyCount),
                 metric: (p) => npmNum(p.downloads),
                 zh,
                 watched: watchedMap,
                 onWatch: toggleWatch,
                 empty:
-                  npm.status === 'loading'
-                    ? '正在取 npm…'
-                    : npm.status === 'error'
-                      ? 'npm 取不到（' + npm.error + '）。点上面的刷新重试。'
-                      : 'npm 名单都落在 GitHub 采样里了。',
+                  all.npm && all.npm.error && !merged.npmTotal
+                    ? 'npm 取不到（' + all.npm.error + '）。GitHub 那两列照常可用，点上面的刷新重试。'
+                    : allBusy
+                      ? '正在取 npm 全量…'
+                      : 'npm 名单都落在 GitHub 全量里了。',
               }),
               h(
                 'div',
@@ -4983,8 +5426,19 @@ window.__ModuleLoader__.load({
           ? h(
               'div',
               { className: 'dsk-main dsk-main-search' },
+              h(AllCol, {
+                title: '全量命中',
+                kicker: '本地 · G ' + merged.ghTotal + ' + N ' + merged.npmTotal,
+                rows: hits,
+                hint: String(hits.length),
+                metric: (p) => (p.badge === 'N' ? npmNum(p.downloads) : '★' + fmtStars(p.stars)),
+                zh,
+                watched: watchedMap,
+                onWatch: toggleWatch,
+                empty: all.status === 'loading' ? '正在取全量…' : '全量里没有命中的，右边是 GitHub 全站的。',
+              }),
               h(DenseCol, {
-                title: '全站搜索',
+                title: 'GitHub 全站',
                 kicker:
                   rs.status === 'loading'
                     ? 'searching github…'
@@ -4998,17 +5452,6 @@ window.__ModuleLoader__.load({
                 watched: watchedMap,
                 onWatch: toggleWatch,
                 empty: remoteEmptyText(rs),
-              }),
-              h(DenseCol, {
-                title: '榜内命中',
-                kicker: 'already loaded',
-                rows: localRows,
-                hint: String(localRows.length),
-                metric: (p) => '★' + fmtStars(p.stars),
-                zh,
-                watched: watchedMap,
-                onWatch: toggleWatch,
-                empty: '已加载的榜里没有，左边是全站的。',
               }),
               h(
                 'div',
@@ -5142,12 +5585,14 @@ window.__ModuleLoader__.load({
                     : '未登录搜索 10 次/分',
                 ),
                 h('span', { key: 'c' }, '结果由宿主缓存 10 分钟'),
+                all.fetchedAt ? h('span', { key: 't' }, allStamp(all.fetchedAt)) : null,
               ]
             : [
-                h('span', { key: 'a' }, '数据 dsh-recommend + GitHub 实时'),
-                h('span', { key: 'b' }, '星数榜已滤掉非插件'),
+                h('span', { key: 'a' }, '数据 GitHub 全量 + npm 全量 + 旧榜单'),
+                h('span', { key: 'b' }, 'G 只在 GitHub · G∩N 两边都有 · N 只在 npm'),
                 h('span', { key: 'c' }, '官方只在顶部条，不进任何榜'),
-                h('span', { key: 'd' }, '点任意一行打开仓库'),
+                all.fetchedAt ? h('span', { key: 't' }, allStamp(all.fetchedAt)) : null,
+                h('span', { key: 'd' }, all.hasToken ? '已带令牌' : '未登录（搜索 10 次/分）'),
               ],
         ),
       );
@@ -5186,7 +5631,7 @@ window.__ModuleLoader__.load({
       );
 
     return {
-      __test: { zhIntro, cleanText, FramePanel, FrameB, WireBand, LeadBlock, ListBlock, AskPanel, WatchPanel, WatchList, useDailyData, buildConsultQuestion, scoreRepo, W_STAR, W_ACT, W_NEW, DensePanel, DenseCol, DenseRowView, denseRow, looksLikeDshPlugin, LEXICON, expandWeighted, searchTerms, matchScore, applySearch, SearchBar, setSearchQuery, getSearchQuery: () => searchQuery, SCENE_PRIMARY, sceneById, sceneTerms, setScene, getScene: () => sceneId, useRemoteSearch, englishTerms, remoteEmptyText, npmBuckets, npmFilter, npmNum, setSource, useSource, useNpmSource, getSource: () => srcMode, installCmd, trimRegistry, intersectBuckets, repoKeyOf, nextSource, useGhTop, GH_TOP_URL },
+      __test: { zhIntro, cleanText, FramePanel, FrameB, WireBand, LeadBlock, ListBlock, AskPanel, WatchPanel, WatchList, useDailyData, buildConsultQuestion, scoreRepo, W_STAR, W_ACT, W_NEW, DensePanel, DenseCol, DenseRowView, denseRow, looksLikeDshPlugin, LEXICON, expandWeighted, searchTerms, matchScore, applySearch, SearchBar, setSearchQuery, getSearchQuery: () => searchQuery, SCENE_PRIMARY, sceneById, sceneTerms, setScene, getScene: () => sceneId, useRemoteSearch, englishTerms, remoteEmptyText, npmBuckets, npmFilter, npmNum, setSource, useSource, useNpmSource, getSource: () => srcMode, installCmd, trimRegistry, intersectBuckets, repoKeyOf, nextSource, useGhTop, GH_TOP_URL, useAllData, useAllDl, mergeAll, allHits, allKeyOf, allStamp, hhmm, agoHours, AllCol, TokenBox, ALL_URL, ALL_DL_URL, TOKEN_URL, A_STEP, pageOf },
       inject: ['slots'],
       apply(ctx) {
         // 1) 左侧导航栏（和「任务看板」/「任务清单」同一排）：点它切到下面的主区域面板。

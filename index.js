@@ -695,14 +695,57 @@ const WATCH_PATH = '/api/daily-consult.watch';
 const WATCH_TTL_MS = 30 * 60 * 1000;
 /** GitHub 仓库状态缓存更久（未登录只有 60 次/小时，省着用）。*/
 const GH_TTL_MS = 6 * 60 * 60 * 1000;
-const GH_HEADERS = (() => {
+/* 令牌：优先读用户在 ⚙ 里填的那份（宿主磁盘，前端永远拿不到原文），
+   其次才是进程环境变量。模块级 const 会在进程启动时定死，所以这里必须是函数。 */
+function dataHome() {
+  return process.env.DSH_HOME || process.env.DSH_PROFILE_DIR || '.';
+}
+
+function tokenFilePath() {
+  return path.join(dataHome(), 'daily-push-token.json');
+}
+
+function envToken() {
+  return String(process.env.GITHUB_TOKEN || process.env.DSH_GITHUB_TOKEN || process.env.GH_TOKEN || '').trim();
+}
+
+/** 5 秒内存缓存：一次 .all 抓取里要建几十个请求头，不必每次都读盘。 */
+let tokenMemo = { at: 0, value: null };
+const TOKEN_MEMO_MS = 5000;
+
+function readTokenFile() {
+  try {
+    const j = JSON.parse(fs.readFileSync(tokenFilePath(), 'utf8'));
+    const token = String((j && j.token) || '').trim();
+    if (!token) return null;
+    return { token, login: String(j.login || ''), savedAt: Number(j.savedAt) || 0 };
+  } catch (err) {
+    return null;
+  }
+}
+
+function currentToken() {
+  const now = Date.now();
+  if (now - tokenMemo.at < TOKEN_MEMO_MS) return tokenMemo.value;
+  const file = readTokenFile();
+  let value = null;
+  if (file) value = { token: file.token, source: 'file', login: file.login, savedAt: file.savedAt };
+  else if (envToken()) value = { token: envToken(), source: 'env', login: '', savedAt: 0 };
+  tokenMemo = { at: now, value };
+  return value;
+}
+
+function ghHeaders(token) {
   const h = { 'user-agent': 'dsh-daily-push', accept: 'application/vnd.github+json' };
-  const token = process.env.GITHUB_TOKEN || process.env.DSH_GITHUB_TOKEN || process.env.GH_TOKEN;
-  if (token) h.authorization = 'Bearer ' + token;
+  const t = token === undefined ? currentToken() : token ? { token } : null;
+  if (t) h.authorization = 'Bearer ' + t.token;
   return h;
-})();
+}
+
 /** 有没有配令牌直接决定搜索限流是 10 次/分（未登录）还是 30 次/分，前端要如实告诉用户。*/
-const GH_HAS_TOKEN = !!(process.env.GITHUB_TOKEN || process.env.DSH_GITHUB_TOKEN || process.env.GH_TOKEN);
+function ghHasToken() {
+  return !!currentToken();
+}
 
 function watchFilePath() {
   const home = process.env.DSH_HOME || process.env.DSH_PROFILE_DIR || '.';
@@ -816,9 +859,9 @@ function listInstalledPlugins() {
 
 async function getJsonQuiet(url) {
   try {
-    const res = await fetch(url, { headers: GH_HEADERS });
-    if (!res.ok) return { ok: false, status: res.status };
-    return { ok: true, data: await res.json() };
+    const res = await fetch(url, { headers: ghHeaders() });
+    if (!res.ok) return { ok: false, status: res.status, headers: res.headers };
+    return { ok: true, data: await res.json(), headers: res.headers };
   } catch (err) {
     return { ok: false, status: 0, error: String((err && err.message) || err) };
   }
@@ -1267,7 +1310,7 @@ async function handleSearch(request) {
     'https://api.github.com/search/repositories?q=' + encodeURIComponent(q) + '&per_page=30';
   let res;
   try {
-    res = await fetch(url, { headers: GH_HEADERS });
+    res = await fetch(url, { headers: ghHeaders() });
   } catch (err) {
     return jsonResponse({ ok: false, error: 'network', detail: String((err && err.message) || err) });
   }
@@ -1276,7 +1319,7 @@ async function handleSearch(request) {
   const rate = {
     remaining: Number.isFinite(remain) ? remain : null,
     resetAt: Number.isFinite(reset) ? reset * 1000 : null,
-    hasToken: GH_HAS_TOKEN,
+    hasToken: ghHasToken(),
   };
   if (!res.ok) {
     const why = res.status === 403 || res.status === 429 ? 'rate_limited' : 'http_' + res.status;
@@ -1623,7 +1666,7 @@ async function handleGhTop(request) {
     if (batch.length < 100) break;
   }
 
-  if (!items.length) return jsonResponse({ ok: false, items: [], error: err || 'fail', hasToken: GH_HAS_TOKEN });
+  if (!items.length) return jsonResponse({ ok: false, items: [], error: err || 'fail', hasToken: ghHasToken() });
   if (!err) ghTopCache = { at: now, pages: want, items };
   return jsonResponse({
     ok: true,
@@ -1632,7 +1675,7 @@ async function handleGhTop(request) {
     pages: want,
     degraded: !!err,
     error: err,
-    hasToken: GH_HAS_TOKEN,
+    hasToken: ghHasToken(),
     fetchedAt: now,
   });
 }
@@ -1700,6 +1743,535 @@ async function handleRecent() {
   const payload = { ok: true, items, leaders, official, total: items.length, since, sinceNew, fetchedAt: now };
   recentCache = { at: now, payload };
   return jsonResponse(payload);
+}
+
+/* ─────────────────── 令牌：存在宿主，前端只看得到「配没配」 ───────────────────
+   0.1.x 把令牌放在进程环境变量里，用户得改启动脚本才能配；0.2.0 改成在面板 ⚙ 里填，
+   宿主写进 DSH_HOME/daily-push-token.json（600 权限）。前端拿到的只有：
+   configured / 来源 / 登录名 / 尾号 4 位 / 剩余额度——原文永不出宿主。 */
+
+const TOKEN_PATH = '/api/daily-consult.token';
+
+/** 探一次额度：/rate_limit 对任何令牌都免费，不计入额度，正好拿来当校验。
+ *  带令牌时顺便问一次 /user 拿登录名（失败不影响校验结果）。 */
+async function probeToken(token) {
+  const headers = ghHeaders(token || '');
+  const out = { ok: false, login: '', search: null, core: null, error: null, detail: null };
+  try {
+    const res = await fetch('https://api.github.com/rate_limit', { headers });
+    if (res.status === 401) {
+      out.error = 'bad_token';
+      return out;
+    }
+    if (!res.ok) {
+      out.error = 'http_' + res.status;
+      return out;
+    }
+    const j = await res.json();
+    const r = (j && j.resources) || {};
+    const pick = (x) => ({
+      limit: Number((x && x.limit) || 0) || 0,
+      remaining: Number((x && x.remaining) || 0) || 0,
+      resetAt: Number((x && x.reset) || 0) * 1000,
+    });
+    out.search = pick(r.search);
+    out.core = pick(r.core);
+    out.ok = true;
+    if (token) {
+      try {
+        const who = await fetch('https://api.github.com/user', { headers });
+        if (who.ok) {
+          const uj = await who.json();
+          out.login = String((uj && uj.login) || '');
+        }
+      } catch (err) {
+        /* 拿不到登录名不影响令牌可用 */
+      }
+    }
+  } catch (err) {
+    out.error = 'network';
+    out.detail = String((err && err.message) || err);
+  }
+  return out;
+}
+
+function writeTokenFile(token, login) {
+  const file = tokenFilePath();
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const body = JSON.stringify({ token, login: login || '', savedAt: Date.now() });
+  const tmp = file + '.tmp';
+  fs.writeFileSync(tmp, body, { encoding: 'utf8', mode: 0o600 });
+  fs.renameSync(tmp, file);
+  try {
+    fs.chmodSync(file, 0o600);
+  } catch (err) {
+    /* Windows 上 chmod 基本是空操作，写失败也不影响功能 */
+  }
+  tokenMemo = { at: 0, value: null };
+}
+
+function clearTokenFile() {
+  try {
+    fs.rmSync(tokenFilePath(), { force: true });
+  } catch (err) {
+    /* 本来就没有 */
+  }
+  tokenMemo = { at: 0, value: null };
+}
+
+function tokenState(extra) {
+  const t = currentToken();
+  return Object.assign(
+    {
+      ok: true,
+      configured: !!t,
+      source: t ? t.source : null,
+      login: t ? t.login : '',
+      /* 尾号 4 位足够让用户确认「填的是哪一个」，又不至于泄露 */
+      hint: t ? '…' + t.token.slice(-4) : '',
+      savedAt: t ? t.savedAt : 0,
+      env: !!envToken(),
+    },
+    extra || {},
+  );
+}
+
+async function handleToken(request) {
+  const method = String((request && request.method) || 'GET').toUpperCase();
+  if (method === 'GET') {
+    let u;
+    try {
+      u = new URL(request.url, 'http://local');
+    } catch (err) {
+      u = null;
+    }
+    const wantRate = !!(u && u.searchParams.get('rate') === '1');
+    const extra = {};
+    if (wantRate) {
+      const t = currentToken();
+      extra.rate = await probeToken(t ? t.token : '');
+      extra.hasToken = !!t;
+    }
+    return jsonResponse(tokenState(extra));
+  }
+
+  if (method === 'DELETE') {
+    clearTokenFile();
+    return jsonResponse(tokenState({ cleared: true }));
+  }
+
+  let body = {};
+  try {
+    body = await request.json();
+  } catch (err) {
+    body = {};
+  }
+  const action = String((body && body.action) || 'save');
+  const raw = String((body && body.token) || '').trim();
+  const t = currentToken();
+
+  if (action === 'clear') {
+    clearTokenFile();
+    return jsonResponse(tokenState({ cleared: true }));
+  }
+
+  if (action === 'test') {
+    const use = raw || (t ? t.token : '');
+    if (!use) return jsonResponse(tokenState({ ok: false, error: 'no_token' }), 400);
+    const probe = await probeToken(use);
+    return jsonResponse(tokenState({ test: probe, error: probe.error }));
+  }
+
+  /* save */
+  if (!raw) return jsonResponse({ ok: false, error: 'no_token' }, 400);
+  /* classic PAT 是 ghp_xxx（40 位），fine-grained 是 github_pat_xxx（含下划线），都命中这个形状；
+     明显不是令牌的输入在这里就挡掉，省一次网络往返。 */
+  if (!/^[A-Za-z0-9_]{20,}$/.test(raw)) {
+    return jsonResponse({ ok: false, error: 'bad_format' }, 400);
+  }
+  const probe = await probeToken(raw);
+  if (!probe.ok) {
+    return jsonResponse(
+      Object.assign({ ok: false, saved: false, error: probe.error || 'invalid' }, { detail: probe.detail }),
+      400,
+    );
+  }
+  writeTokenFile(raw, probe.login);
+  return jsonResponse(tokenState({ saved: true, probe }));
+}
+
+/* ─────────────────── 全量数据：GitHub 1000 + npm 2499，一屏对照 ───────────────────
+   0.1.x 只有 GitHub 300 条 + npm 250 条的抽样；0.2.0 要「按 owner/repo 归一、一屏并列两源」，
+   就得先把两边都翻到底：GitHub 搜索单查询上限 1000 条（10 页 ×100），
+   npm 搜索上限 2500 条（第 11 页就空了）。
+   数据变化很慢，缓存 6 小时落在磁盘上，重启不白抓；失败/不完整时 10 分钟后再试。 */
+
+const ALL_PATH = '/api/daily-consult.all';
+const ALL_DL_PATH = '/api/daily-consult.all.dl';
+const ALL_TTL_MS = 6 * 60 * 60 * 1000;
+const ALL_RETRY_MS = 10 * 60 * 1000;
+/** 未登录时 GitHub 搜索只有 10 次/分、60 次/时，抓满 20 页会直接把自己锁死，
+ *  所以没有令牌就只翻 4 页（400 条）+ 3 页（300 条），有令牌才翻到底。 */
+const ALL_GH_PAGES_TOKEN = 10;
+const ALL_GH_PAGES_ANON = 4;
+const ALL_GH_UPD_PAGES_TOKEN = 10;
+const ALL_GH_UPD_PAGES_ANON = 3;
+const ALL_NPM_PAGES = 10;
+const ALL_NPM_SIZE = 250;
+const ALL_DL_CAP = 700;
+const ALL_QUERY = 'topic:dsh-plugin fork:false';
+
+let allBody = { at: 0, body: '' };
+
+function allCachePath() {
+  return path.join(dataHome(), 'cache', 'daily-push-all.json');
+}
+
+let allDisk = null;
+
+function readAllDisk() {
+  if (allDisk) return allDisk;
+  try {
+    const j = JSON.parse(fs.readFileSync(allCachePath(), 'utf8'));
+    allDisk = j && typeof j === 'object' ? j : { v: 2, github: null, npm: null };
+  } catch (err) {
+    allDisk = { v: 2, github: null, npm: null };
+  }
+  return allDisk;
+}
+
+function writeAllDisk() {
+  try {
+    const file = allCachePath();
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const tmp = file + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(allDisk));
+    fs.renameSync(tmp, file);
+    allBody = { at: 0, body: '' };
+  } catch (err) {
+    /* 写不进去不影响这次返回 */
+  }
+}
+
+function needRefresh(entry, now, force) {
+  if (force) return true;
+  if (!entry || !Array.isArray(entry.items) || !entry.items.length) return true;
+  const ttl = entry.ok === false ? ALL_RETRY_MS : ALL_TTL_MS;
+  const seen = Number(entry.checkedAt || entry.at) || 0;
+  return now - seen > ttl;
+}
+
+function ghItem(it) {
+  const full = String((it && it.full_name) || '');
+  if (!full) return null;
+  return {
+    fullName: full,
+    url: it.html_url || 'https://github.com/' + full,
+    /* 描述只留前 180 字：1000 条 × 长描述会把这份 JSON 撑到几 MB */
+    description: String(it.description || '').slice(0, 180),
+    stars: Number(it.stargazers_count) || 0,
+    pushedAt: it.pushed_at || '',
+    createdAt: it.created_at || '',
+    topics: Array.isArray(it.topics) ? it.topics.slice(0, 5) : [],
+    language: it.language || '',
+    source: 'gh',
+  };
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** 翻一列搜索结果，边翻边往共享的 items/seen 里塞（两条查询好互相去重）。
+ *  GitHub 未登录时搜索只有 10 次/分，而且对并发非常敏感——两个搜索请求同时发出去会直接吃
+ *  二级限流（403，但 x-ratelimit-remaining 还大于 0），所以这里串行 + 留间隔。
+ *  真被限流就带着已经拿到的条目回去（partial），列不清空，10 分钟后自动再试。 */
+async function searchPages(query, sort, pages, seen, items, hasToken) {
+  let error = null;
+  let remoteTotal = 0;
+  let resetAt = 0;
+  let remaining = null;
+  let page = 0;
+  const gap = hasToken ? 350 : 1200;
+  for (let i = 1; i <= pages; i++) {
+    if (i > 1) await sleep(gap);
+    page = i;
+    const url =
+      'https://api.github.com/search/repositories?q=' +
+      encodeURIComponent(query) +
+      '&sort=' + sort + '&order=desc&per_page=100&page=' + i;
+    let res = await getJsonQuiet(url);
+    /* 二级限流是一次性的，等一下再来通常就通了；额度真的用光（remaining=0）就别白撞。 */
+    if (!res.ok && (res.status === 403 || res.status === 429) && remaining !== 0) {
+      await sleep(2500);
+      res = await getJsonQuiet(url);
+    }
+    if (!res.ok) {
+      const h = res.headers;
+      if (h && typeof h.get === 'function') {
+        const rem = Number(h.get('x-ratelimit-remaining'));
+        if (Number.isFinite(rem)) remaining = rem;
+        const rst = Number(h.get('x-ratelimit-reset'));
+        if (rst) resetAt = rst * 1000;
+      }
+      error = res.status === 403 || res.status === 429 ? 'rate_limited' : res.status ? 'http_' + res.status : res.error || 'network';
+      break;
+    }
+    const rh = res.headers;
+    if (rh && typeof rh.get === 'function') {
+      const rem = Number(rh.get('x-ratelimit-remaining'));
+      if (Number.isFinite(rem)) remaining = rem;
+      const rst = Number(rh.get('x-ratelimit-reset'));
+      if (rst) resetAt = rst * 1000;
+    }
+    const data = res.data || {};
+    if (i === 1) remoteTotal = Number(data.total_count) || 0;
+    const list = data.items || [];
+    for (const it of list) {
+      const row = ghItem(it);
+      if (!row || seen[row.fullName]) continue;
+      seen[row.fullName] = 1;
+      items.push(row);
+    }
+    if (list.length < 100) break;
+  }
+  return { error, remoteTotal, resetAt, remaining, page };
+}
+
+async function refreshGithub() {
+  const hasToken = ghHasToken();
+  const seen = Object.create(null);
+  const items = [];
+  let error = null;
+  let remoteTotal = 0;
+  let resetAt = 0;
+  let remaining = null;
+  let pages = 0;
+  /* 两条查询串行：星数榜回答「谁最热」，最近更新榜回答「谁还在动」。
+     第一条被限流的话第二条也没有额度，直接停，别把 10 次/分耗在注定 403 的请求上。 */
+  const runs = [
+    { sort: 'stars', pages: hasToken ? ALL_GH_PAGES_TOKEN : ALL_GH_PAGES_ANON },
+    { sort: 'updated', pages: hasToken ? ALL_GH_UPD_PAGES_TOKEN : ALL_GH_UPD_PAGES_ANON },
+  ];
+  for (const run of runs) {
+    const r = await searchPages(ALL_QUERY, run.sort, run.pages, seen, items, hasToken);
+    pages += r.page;
+    if (r.remoteTotal) remoteTotal = Math.max(remoteTotal, r.remoteTotal);
+    if (r.resetAt) resetAt = r.resetAt;
+    if (r.remaining !== null) remaining = r.remaining;
+    if (r.error) {
+      error = r.error;
+      if (r.error === 'rate_limited') break;
+    }
+  }
+  return {
+    items,
+    error,
+    partial: !!(error && items.length),
+    remoteTotal,
+    pages,
+    resetAt,
+    remaining,
+    hasToken,
+  };
+}
+
+/** 进度条用的全量 npm 行：去掉恒等于 1 的 score.detail，只留前端要显示的字段。 */
+function compactNpmRow(o) {
+  const p = (o && o.package) || {};
+  const links = p.links || {};
+  const name = String(p.name || '');
+  if (!name) return null;
+  const repoRaw = String(links.repository || '').replace(/^git\+/i, '').replace(/\.git$/i, '');
+  const m = /^https?:\/\/(?:www\.)?github\.com\/([^/]+)\/([^/#?]+)/i.exec(repoRaw);
+  return {
+    fullName: m ? m[1] + '/' + m[2] : name,
+    name,
+    displayName: name,
+    description: String(p.description || '').slice(0, 180),
+    version: String(p.version || ''),
+    date: String(p.date || ''),
+    npmUrl: links.npm || 'https://www.npmjs.com/package/' + name,
+    repoUrl: links.repository || '',
+    relevance: Number((o && o.score && o.score.final) || 0) || 0,
+    source: 'npm',
+  };
+}
+
+async function refreshNpm() {
+  const items = [];
+  const seen = Object.create(null);
+  let pages = 0;
+  let error = null;
+  let total = 0;
+  for (let i = 0; i < ALL_NPM_PAGES; i++) {
+    const url =
+      'https://registry.npmjs.org/-/v1/search?text=' +
+      encodeURIComponent('keywords:dsh-plugin') +
+      '&size=' + ALL_NPM_SIZE + '&from=' + i * ALL_NPM_SIZE;
+    let data = null;
+    try {
+      const res = await fetch(url, { headers: { accept: 'application/json' } });
+      if (!res.ok) error = 'http_' + res.status;
+      else data = await res.json();
+    } catch (err) {
+      error = 'network';
+    }
+    if (!data) break;
+    total = Number(data.total) || total;
+    const objs = data.objects || [];
+    for (const o of objs) {
+      const p = (o && o.package) || {};
+      if (!isNpmPlugin(p)) continue;
+      const row = compactNpmRow(o);
+      if (!row || seen[row.name]) continue;
+      seen[row.name] = 1;
+      items.push(row);
+    }
+    pages++;
+    /* npm 的 from+size 最多到 2500，第 11 页直接空；先判空再判 short page 再判总数，三重收尾 */
+    if (!objs.length || objs.length < ALL_NPM_SIZE) break;
+    if (total && i * ALL_NPM_SIZE + objs.length >= total) break;
+  }
+  return { items, pages, total, error };
+}
+
+function mergeEntry(prev, fresh, now, kind) {
+  const old = prev && Array.isArray(prev.items) && prev.items.length ? prev : null;
+  const items = fresh.items || [];
+  if (!items.length) {
+    if (old) {
+      /* 这次没抓到，但磁盘上有旧的：继续用旧的，只把「过期」和错误原因告诉前端。 */
+      return Object.assign({}, old, { checkedAt: now, error: fresh.error || 'fail', stale: true, ok: false });
+    }
+    return { at: 0, checkedAt: now, items: [], total: 0, pages: 0, error: fresh.error || 'fail', ok: false, stale: false };
+  }
+  return {
+    at: now,
+    checkedAt: now,
+    items,
+    total: items.length,
+    pages: fresh.pages || 0,
+    remoteTotal: fresh.remoteTotal || 0,
+    error: fresh.error || null,
+    partial: !!fresh.partial,
+    stale: false,
+    ok: !fresh.error,
+    resetAt: fresh.resetAt || 0,
+    remaining: fresh.remaining === undefined ? null : fresh.remaining,
+    kind,
+  };
+}
+
+async function handleAll(request) {
+  let u;
+  try {
+    u = new URL(request.url, 'http://local');
+  } catch (err) {
+    return jsonResponse({ ok: false, error: 'bad_url' }, 400);
+  }
+  const force = u.searchParams.get('force') === '1';
+  const now = Date.now();
+  const disk = readAllDisk();
+  const wantGh = needRefresh(disk.github, now, force);
+  const wantNpm = needRefresh(disk.npm, now, force);
+  let changed = false;
+
+  const jobs = [];
+  if (wantGh) {
+    jobs.push(
+      refreshGithub().then((g) => {
+        disk.github = mergeEntry(disk.github, g, Date.now(), 'github');
+        changed = true;
+      }),
+    );
+  }
+  if (wantNpm) {
+    jobs.push(
+      refreshNpm().then((n) => {
+        disk.npm = mergeEntry(disk.npm, n, Date.now(), 'npm');
+        changed = true;
+      }),
+    );
+  }
+  if (jobs.length) await Promise.all(jobs);
+  if (changed) writeAllDisk();
+
+  const github = disk.github || { at: 0, items: [], total: 0 };
+  const npm = disk.npm || { at: 0, items: [], total: 0 };
+  const ghItems = Array.isArray(github.items) ? github.items : [];
+  const npmItems = Array.isArray(npm.items) ? npm.items : [];
+  const payload = {
+    ok: ghItems.length + npmItems.length > 0,
+    fetchedAt: Math.max(Number(github.at) || 0, Number(npm.at) || 0),
+    checkedAt: now,
+    hasToken: ghHasToken(),
+    github: {
+      at: Number(github.at) || 0,
+      total: ghItems.length,
+      pages: github.pages || 0,
+      remoteTotal: github.remoteTotal || 0,
+      partial: !!github.partial,
+      stale: !!github.stale,
+      error: github.error || null,
+      items: ghItems,
+    },
+    npm: {
+      at: Number(npm.at) || 0,
+      total: npmItems.length,
+      pages: npm.pages || 0,
+      remoteTotal: npm.remoteTotal || 0,
+      error: npm.error || null,
+      stale: !!npm.stale,
+      items: npmItems,
+    },
+  };
+
+  /* 1MB 的 payload 每次重新序列化要几十毫秒；同一个缓存版本只编一次。 */
+  if (!force && allBody.body && now - allBody.at < 60000) {
+    return new Response(allBody.body, {
+      status: 200,
+      headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
+    });
+  }
+  const body = JSON.stringify(payload);
+  allBody = { at: now, body };
+  return new Response(body, {
+    status: 200,
+    headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
+  });
+}
+
+/** 下载量单独走一路：全量名单有两千多条，不能为了补下载量把整份列表再传一遍。 */
+async function handleAllDl(request) {
+  let cap = ALL_DL_CAP;
+  try {
+    const u = new URL(request.url, 'http://local');
+    const want = Number(u.searchParams.get('cap'));
+    if (Number.isFinite(want) && want > 0) cap = Math.min(ALL_DL_CAP, want);
+  } catch (err) {
+    /* 用默认值 */
+  }
+  const disk = readAllDisk();
+  const npm = disk.npm;
+  if (!npm || !Array.isArray(npm.items) || !npm.items.length) {
+    return jsonResponse({ ok: false, error: 'no_data', map: {}, at: 0 }, 404);
+  }
+  const names = npm.items
+    .slice()
+    .sort((a, b) => Number(b.relevance || 0) - Number(a.relevance || 0))
+    .slice(0, cap)
+    .map((r) => r.name);
+  const map = await fetchDownloads(names);
+  const dlDisk = readDlDisk();
+  let covered = 0;
+  for (const r of npm.items) if (typeof dlDisk.map[r.name] === 'number') covered++;
+  return jsonResponse({
+    ok: true,
+    at: Number(dlDisk.at) || 0,
+    map,
+    requested: names.length,
+    total: npm.items.length,
+    covered,
+  });
 }
 
 export function apply(ctx) {
@@ -1812,6 +2384,39 @@ export function apply(ctx) {
           fetch: (request) => handleGhTop(request),
         }),
       'dsh-daily-push: github top sample',
+    );
+
+    host.effect(
+      () =>
+        host.connection.fetch.register({
+          path: ALL_PATH,
+          methods: ['GET'],
+          requestBody: 'buffered',
+          fetch: (request) => handleAll(request),
+        }),
+      'dsh-daily-push: all sources',
+    );
+
+    host.effect(
+      () =>
+        host.connection.fetch.register({
+          path: ALL_DL_PATH,
+          methods: ['GET'],
+          requestBody: 'buffered',
+          fetch: (request) => handleAllDl(request),
+        }),
+      'dsh-daily-push: all downloads',
+    );
+
+    host.effect(
+      () =>
+        host.connection.fetch.register({
+          path: TOKEN_PATH,
+          methods: ['GET', 'POST', 'DELETE'],
+          requestBody: 'buffered',
+          fetch: (request) => handleToken(request),
+        }),
+      'dsh-daily-push: github token',
     );
     ctx.effect(
       () =>

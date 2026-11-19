@@ -1,7 +1,7 @@
 {
   "name": "dsh-daily-push",
-  "version": "0.1.1",
-  "description": "每日推送：DSH 插件雷达。三榜并列 + 中文搜索 + G/∩/N 三源对照（GitHub / 交集 / npm），每行一键复制安装命令。",
+  "version": "0.2.0",
+  "description": "每日推送：DSH 插件雷达。GitHub 与 npm 全量对照（G / G∩N / N 角标）+ 三榜并列 + 中文搜索，可填 GitHub 令牌提高上限，每行一键复制安装命令。",
   "license": "MIT",
   "author": "dsh-daily-push contributors",
   "type": "module",
@@ -40,7 +40,7 @@
   },
   "meta": {
     "title": "每日推送",
-    "description": "三榜并列的 DSH 插件雷达：星数 / 新建 / 活跃各一列，支持中文关键词搜索、场景分类、GitHub 与 npm 双源对照，内置咨询与关注。"
+    "description": "全量对照的 DSH 插件雷达：GitHub（最多 1000 条）与 npm（2500 条）按 owner/repo 归一合并，每行标 G / G∩N / N；三榜并列、中文搜索、场景分类、内置咨询与关注，可填 GitHub 令牌。"
   },
   "icon": "./icon.svg",
   "dsh": {
