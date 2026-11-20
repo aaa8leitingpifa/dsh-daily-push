@@ -15,6 +15,7 @@ import { join as __joinLog } from 'node:path';
 
 import fs from 'node:fs';
 import path from 'node:path';
+import zlib from 'node:zlib';
 
 const HEALTH_PATH = '/api/daily-consult.health';
 const ASK_PATH = '/api/daily-consult';
@@ -104,6 +105,23 @@ function attempt(fn) {
   } catch {
     return undefined;
   }
+}
+
+/** 解析这次调用该用哪个模型：body 显式指定优先，否则取 DSH 的默认选择。 */
+function currentSelection(host, body) {
+  let provider = body && body.provider;
+  let model = body && body.model;
+  let reasoningEffort = body && body.reasoningEffort;
+  if (!provider || !model) {
+    const defaultModel = attempt(() => host.get('agentDefaultModel'));
+    const selection = defaultModel ? attempt(() => defaultModel.currentSelection()) : undefined;
+    if (selection) {
+      provider = provider || selection.provider;
+      model = model || selection.model;
+      if (reasoningEffort === undefined) reasoningEffort = selection.reasoningEffort;
+    }
+  }
+  return { provider, model, reasoningEffort };
 }
 
 async function handleHealth(host) {
@@ -2274,7 +2292,935 @@ async function handleAllDl(request) {
   });
 }
 
+
+/* ─────────────────── 猜你喜欢：按已装插件推演"还缺什么" ───────────────────
+   和咨询的区别：咨询是用户提问，这里是模型自己看一遍你装了什么，推断出还没被满足的
+   需求（"你在用本地笔记，可能想多端同步"），再交回前端去全量目录里找对应的插件。
+   模型只产出"需求 + 英文关键词"，不做检索——检索在客户端用现成的 matchScore 做。 */
+
+const SUGGEST_PATH = '/api/daily-consult.suggest';
+const SUGGEST_TTL_MS = 12 * 60 * 60 * 1000;
+const SUGGEST_MAX_INSTALLED = 40;
+const SUGGEST_NEEDS = 6;
+const SUGGEST_TOKENS = 800;
+
+const SUGGEST_SYSTEM = [
+  '你是 DeepSeek Harness（DSH）的插件顾问。用户装了一批插件，你要推断他"接下来最可能还需要什么能力"。',
+  '输出必须是一个 JSON 对象：{"needs":[{"title":"…","why":"…","keys":["…","…"]}]}，不要代码围栏、不要解释、不要多余文字。',
+  'needs 给 5 到 6 条，按"对他有多缺"排序。',
+  'title：不超过 8 个字的中文短语，描述一类能力（例如"笔记同步""截图 OCR""终端复用"）。',
+  'why：不超过 30 个字，说清"为什么这个人会缺它"，要结合他装了什么，不要套话。',
+  'keys：2 到 4 个英文小写关键词，用来在插件描述里检索（例如 ["sync","notes","cloud"]）；不要用 desktop、ui、tool 这类到处都有的词。',
+  '已经装了的能力不要再提；也不要推荐具体某个插件名，只描述需求。',
+].join('\n');
+
+function suggestCachePath() {
+  return path.join(dataHome(), 'cache', 'daily-push-suggest.json');
+}
+
+function readSuggestDisk() {
+  try {
+    const raw = fs.readFileSync(suggestCachePath(), 'utf8');
+    const doc = JSON.parse(raw);
+    if (doc && doc.v === 1 && Array.isArray(doc.needs)) return doc;
+  } catch (err) {
+    /* 没有或坏了都当没有 */
+  }
+  return null;
+}
+
+function writeSuggestDisk(doc) {
+  try {
+    const file = suggestCachePath();
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const tmp = file + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(doc));
+    fs.renameSync(tmp, file);
+  } catch (err) {
+    /* 写不进去就算了，下次重算 */
+  }
+}
+
+function hashNames(names) {
+  let h = 5381;
+  for (const n of names) {
+    const s = String(n).toLowerCase();
+    for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0;
+  }
+  return (h >>> 0).toString(36);
+}
+
+/** 本机已装的 DSH 插件（和 .installed 一个口径，这里只要名字）。 */
+function installedNames() {
+  const dir = resolveProfileDir() || process.env.DSH_HOME || '';
+  if (!dir) return [];
+  const nm = path.join(dir, 'node_modules');
+  const names = [];
+  try {
+    for (const ent of fs.readdirSync(nm, { withFileTypes: true })) {
+      if (ent.name.startsWith('.')) continue;
+      if (ent.name.startsWith('@')) {
+        try {
+          for (const sub of fs.readdirSync(path.join(nm, ent.name))) names.push(ent.name + '/' + sub);
+        } catch {}
+      } else if (ent.isDirectory() || ent.isSymbolicLink()) {
+        names.push(ent.name);
+      }
+    }
+  } catch (err) {
+    return [];
+  }
+  return names.sort();
+}
+
+/** 已装 ∩ 目录里的插件，带上中文/英文简介，喂给模型当上下文。 */
+function installedContext(names) {
+  const disk = readAllDisk();
+  const npm = disk && disk.npm && Array.isArray(disk.npm.items) ? disk.npm.items : [];
+  const gh = disk && disk.github && Array.isArray(disk.github.items) ? disk.github.items : [];
+  const byName = new Map();
+  for (const r of npm) if (r && r.name) byName.set(String(r.name).toLowerCase(), r);
+  const byRepo = new Map();
+  for (const r of gh) if (r && r.fullName) byRepo.set(String(r.fullName).toLowerCase(), r);
+  const out = [];
+  for (const n of names) {
+    const key = String(n).toLowerCase();
+    const row = byName.get(key);
+    let repo = row && row.fullName ? byRepo.get(String(row.fullName).toLowerCase()) : null;
+    if (!row && !repo) continue;
+    const desc = clipText((row && row.description) || (repo && repo.description) || '', 70);
+    out.push({ name: n, desc });
+    if (out.length >= SUGGEST_MAX_INSTALLED) break;
+  }
+  return out;
+}
+
+/** 模型不可用时按全站热门给出保底推荐（明确标记 mode，前端会说明）。 */
+function popularNeeds() {
+  const disk = readAllDisk();
+  const gh = disk && disk.github && Array.isArray(disk.github.items) ? disk.github.items : [];
+  const counts = new Map();
+  for (const r of gh) {
+    const topics = Array.isArray(r.topics) ? r.topics : [];
+    for (const t of topics) {
+      const k = String(t || '').toLowerCase();
+      if (!k || k === 'dsh-plugin' || k === 'dsh' || k.length < 3) continue;
+      counts.set(k, (counts.get(k) || 0) + 1);
+    }
+  }
+  const top = Array.from(counts.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, SUGGEST_NEEDS);
+  return top.map(([k, n]) => ({
+    title: k,
+    why: '全站热门方向（' + n + ' 个仓库打这个标签）',
+    keys: [k],
+  }));
+}
+
+function parseNeeds(text) {
+  const raw = String(text || '');
+  const start = raw.indexOf('{');
+  const end = raw.lastIndexOf('}');
+  if (start < 0 || end <= start) return null;
+  let doc = null;
+  try {
+    doc = JSON.parse(raw.slice(start, end + 1));
+  } catch (err) {
+    return null;
+  }
+  const list = doc && Array.isArray(doc.needs) ? doc.needs : null;
+  if (!list) return null;
+  const out = [];
+  for (const it of list) {
+    if (!it || typeof it !== 'object') continue;
+    const title = clipText(it.title, 20).trim();
+    const keys = (Array.isArray(it.keys) ? it.keys : [])
+      .map((k) => String(k || '').toLowerCase().trim())
+      .filter((k) => k && k.length > 1)
+      .slice(0, 4);
+    if (!title || !keys.length) continue;
+    out.push({ title, why: clipText(it.why, 60).trim(), keys });
+    if (out.length >= SUGGEST_NEEDS) break;
+  }
+  return out.length ? out : null;
+}
+
+function suggestPrompt(digest) {
+  return [
+    '【本机概况】以下是从这台机器上只读扫出来的结构摘要（文件名、标题、依赖名、任务标题、会话标题；不含代码与聊天正文）：',
+    '',
+    digest,
+    '',
+    '请推断这个人接下来最可能还需要哪 5-6 类能力，按上面的 JSON 格式输出。',
+  ].join('\n');
+}
+
+/** 一次非流式模型调用，只取文本。 */
+async function llmText(host, opts) {
+  const selection = currentSelection(host, opts.body || {});
+  if (!selection.provider || !selection.model) throw new Error('拿不到默认模型');
+  if (typeof (host.llm && host.llm.stream) !== 'function') throw new Error('host.llm.stream 不可用');
+  let text = '';
+  const chunks = host.llm.stream({
+    provider: selection.provider,
+    model: selection.model,
+    reasoningEffort: selection.reasoningEffort,
+    system: opts.system,
+    temperature: opts.temperature == null ? 0.4 : opts.temperature,
+    maxTokens: opts.maxTokens || SUGGEST_TOKENS,
+    messages: [{ role: 'user', content: [{ type: 'text', text: opts.user }] }],
+  });
+  for await (const chunk of chunks) {
+    if (!chunk || typeof chunk !== 'object') continue;
+    if (chunk.type === 'text-delta' && chunk.text) text += chunk.text;
+    else if (chunk.type === 'finish' && chunk.reason && chunk.reason.kind === 'error') {
+      const f = chunk.reason.failure;
+      throw new Error((f && (f.message || f.code)) || '模型调用失败');
+    }
+  }
+  if (!text.trim()) throw new Error('模型没有返回文字');
+  return { text, model: selection.provider + ' / ' + selection.model };
+}
+
+async function handleSuggest(host, request) {
+  let body = {};
+  try {
+    body = await request.json();
+  } catch {
+    body = {};
+  }
+  const force = !!(body && body.force);
+  const sessions = (Array.isArray(body.sessions) ? body.sessions : [])
+    .filter((x) => typeof x === 'string' && x.startsWith('session-'))
+    .slice(0, 3);
+  const digest = buildDigest({ sessions });
+  const names = installedNames();
+  const list = installedContext(names);
+  const fingerprint = hashNames([digest, ...names]);
+  const now = Date.now();
+
+  /* 预览：不发模型，只把「这次会发什么」原样吐出来，让用户先看一眼 */
+  if (body && body.preview) {
+    return jsonResponse({
+      ok: true,
+      preview: true,
+      chars: digest.length,
+      sessions,
+      digest,
+      basedOn: list.length,
+    });
+  }
+
+  if (!force) {
+    const disk = readSuggestDisk();
+    if (disk && disk.fingerprint === fingerprint && now - Number(disk.at || 0) < SUGGEST_TTL_MS) {
+      return jsonResponse({
+        ok: true,
+        cached: true,
+        at: disk.at,
+        ttlMs: SUGGEST_TTL_MS,
+        mode: disk.mode || 'llm',
+        model: disk.model || null,
+        basedOn: list.length,
+        chars: digest.length,
+        sessions,
+        needs: disk.needs,
+      });
+    }
+  }
+
+  let needs = null;
+  let mode = 'llm';
+  let model = null;
+  let error = null;
+  try {
+    if (!list.length) throw new Error('本机没有可识别的插件');
+    const res = await llmText(host, {
+      body,
+      system: SUGGEST_SYSTEM,
+      user: suggestPrompt(digest),
+      temperature: 0.5,
+      maxTokens: SUGGEST_TOKENS,
+    });
+    needs = parseNeeds(res.text);
+    model = res.model;
+    if (!needs) throw new Error('模型没有按格式返回');
+  } catch (err) {
+    error = String((err && err.message) || err);
+    mode = 'popular';
+    needs = popularNeeds();
+    if (!needs.length) needs = null;
+  }
+  if (!needs) {
+    return jsonResponse({ ok: false, error: error || 'no_needs', basedOn: list.length, chars: digest.length, sessions }, 503);
+  }
+  const doc = { v: 1, at: now, fingerprint, mode, model, needs };
+  writeSuggestDisk(doc);
+  return jsonResponse({
+    ok: true,
+    cached: false,
+    at: now,
+    ttlMs: SUGGEST_TTL_MS,
+    mode,
+    model,
+    error,
+    basedOn: list.length,
+    needs,
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 猜你喜欢 · 本地画像扫描（只读，只取结构）
+//
+// 目录、文件名、md 标题、依赖名、看板任务标题、会话标题；正文默认不读。
+// 扫出来的摘要先给用户预览，确认后才拿去调模型。
+// ═══════════════════════════════════════════════════════════════════════════
+
+const SCAN_PATH = '/api/daily-consult.scan';
+const SESSIONS_PATH = '/api/daily-consult.sessions';
+const SESSION_BODY_PATH = '/api/daily-consult.session';
+const SCAN_MAX_CHARS = 6000;
+const SCAN_HEAD_BYTES = 64 * 1024;
+const SCAN_FILE_MAX_BYTES = 4 * 1024 * 1024;
+
+/** 扫描设置默认值；settings 命名空间注册成功后由用户在设置页覆盖。 */
+const SCAN_DEFAULTS = {
+  scanWorkspace: true,
+  scanBoard: true,
+  scanSessions: true,
+  sessionBody: false,
+  sessionBodyLimit: 20,
+  sessionBodyChars: 12000,
+  assistantChars: 160,
+  summaryChars: 600,
+  workspaces: [],
+  maxFiles: 2000,
+  maxSuggestions: 5,
+  refreshHours: 12,
+  searchMode: 'search',
+};
+
+/** 只把这些扩展名算作「值得看一眼」，其余（图片、压缩包、二进制）跳过。 */
+const SCAN_EXT = new Set([
+  '.md', '.markdown', '.txt', '.json', '.yml', '.yaml',
+  '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.vue',
+  '.py', '.gd', '.cs', '.rs', '.go', '.java', '.kt',
+  '.css', '.scss', '.html', '.toml', '.ini', '.cfg',
+]);
+
+/** 这些目录不进：依赖、版本库、构建产物、缓存。 */
+const SCAN_SKIP_DIRS = new Set([
+  'node_modules', '.git', '.svn', '.hg', 'dist', 'build', 'out',
+  '.next', '.nuxt', '.cache', '.parcel-cache', 'coverage', '__pycache__',
+  '.venv', 'venv', 'env', 'target', 'bin', 'obj', 'logs',
+  '.idea', '.vscode', 'tmp', 'temp', '.tmp-dsh', '.npm-cache', 'vendor',
+]);
+
+let schemaLibPromise = null;
+/** schemastery 只能动态导入：仓库包目录上面没有 node_modules，生产态由宿主提供。 */
+function loadSchemaLib() {
+  if (schemaLibPromise === null) {
+    schemaLibPromise = import('@deepseek-ai/schemastery')
+      .then((mod) => mod.default || mod)
+      .catch(() => null);
+  }
+  return schemaLibPromise;
+}
+
+function buildScanSchema(z) {
+  return z.object({
+    scanWorkspace: z.boolean().default(true),
+    scanBoard: z.boolean().default(true),
+    scanSessions: z.boolean().default(true),
+    sessionBody: z.boolean().default(false),
+    sessionBodyLimit: z.number().default(20),
+    sessionBodyChars: z.number().default(12000),
+    assistantChars: z.number().default(160),
+    summaryChars: z.number().default(600),
+    workspaces: z.array(z.string()).default([]),
+    maxFiles: z.number().default(2000),
+    maxSuggestions: z.number().default(5),
+    refreshHours: z.number().default(12),
+    searchMode: z.union(['search', 'consult']).default('search'),
+  });
+}
+
+/** settings.register 返回的作用域；没注册上就退回默认值。 */
+let scanSettingsScope = null;
+
+function scanSettings() {
+  const base = { ...SCAN_DEFAULTS };
+  try {
+    const live = scanSettingsScope && scanSettingsScope.value;
+    if (live && typeof live === 'object') return { ...base, ...live };
+  } catch (err) {
+    /* 读不到就用默认 */
+  }
+  return base;
+}
+
+function scanCachePath() {
+  return path.join(dataHome(), 'cache', 'daily-push-scan.json');
+}
+
+function readScanDisk() {
+  try {
+    const doc = JSON.parse(fs.readFileSync(scanCachePath(), 'utf8'));
+    if (doc && typeof doc.text === 'string' && Number(doc.at) > 0) return doc;
+  } catch (err) {
+    /* 没有就算了 */
+  }
+  return null;
+}
+
+function writeScanDisk(doc) {
+  try {
+    const file = scanCachePath();
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const tmp = file + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(doc));
+    fs.renameSync(tmp, file);
+  } catch (err) {
+    /* 写不进去不影响这次扫描 */
+  }
+}
+
+
+/** 读文件开头若干字节，抠出 md 的一到三级标题。 */
+function mdHeads(abs) {
+  let fd = -1;
+  try {
+    fd = fs.openSync(abs, 'r');
+    const buf = Buffer.alloc(SCAN_HEAD_BYTES);
+    const n = fs.readSync(fd, buf, 0, SCAN_HEAD_BYTES, 0);
+    const text = buf.subarray(0, n).toString('utf8');
+    const heads = [];
+    for (const line of text.split(/\r?\n/)) {
+      const m = /^#{1,3}\s+(.+?)\s*#*\s*$/.exec(line);
+      if (m === null) continue;
+      const t = m[1].replace(/[*_]/g, '').trim();
+      if (t === '' || t.length > 30) continue;
+      if (!heads.includes(t)) heads.push(t);
+      if (heads.length >= 4) break;
+    }
+    return heads;
+  } catch (err) {
+    return [];
+  } finally {
+    if (fd >= 0) {
+      try { fs.closeSync(fd); } catch (err) { /* ignore */ }
+    }
+  }
+}
+
+/**
+ * 走一遍目录收集文件清单；超过配额时按修改时间保留最新的那批，
+ * 免得一个巨大的产物目录把名额吃光。
+ */
+function scanWorkspaceFiles(root, maxFiles) {
+  const cap = Math.max(100, Math.min(20000, Number(maxFiles) || 2000));
+  const files = [];
+  let dirTotal = 0;
+
+  const walk = (dir, depth) => {
+    if (depth > 7 || files.length >= cap * 2) return;
+    let ents = null;
+    try { ents = fs.readdirSync(dir, { withFileTypes: true }); } catch (err) { return; }
+    for (const ent of ents) {
+      if (files.length >= cap * 2) return;
+      const abs = path.join(dir, ent.name);
+      if (ent.isDirectory()) {
+        const low = ent.name.toLowerCase();
+        if (low.startsWith('.') || SCAN_SKIP_DIRS.has(low)) continue;
+        dirTotal += 1;
+        walk(abs, depth + 1);
+        continue;
+      }
+      if (!ent.isFile()) continue;
+      if (ent.name.startsWith('.')) continue;
+      const ext = path.extname(ent.name).toLowerCase();
+      if (!SCAN_EXT.has(ext)) continue;
+      let st = null;
+      try { st = fs.statSync(abs); } catch (err) { continue; }
+      if (st.size > SCAN_FILE_MAX_BYTES) continue;
+      files.push({
+        rel: path.relative(root, abs).split(path.sep).join('/'),
+        ext,
+        size: st.size,
+        mtime: st.mtimeMs,
+      });
+    }
+  };
+
+  walk(root, 0);
+  files.sort((a, b) => b.mtime - a.mtime);
+  return { files: files.slice(0, cap), dirs: dirTotal, scanned: files.length, cap };
+}
+
+function shortName(rel) {
+  const parts = rel.split('/');
+  return parts.length <= 3 ? rel : parts.slice(-2).join('/');
+}
+
+
+/** 已装插件：profile 的 package.json 依赖就是权威清单。 */
+function digestInstalled() {
+  const dir = resolveProfileDir() || process.env.DSH_HOME || '';
+  if (!dir) return [];
+  let doc = null;
+  try { doc = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8')); } catch (err) { return []; }
+  const deps = Object.keys(doc.dependencies || {}).filter((n) => n !== 'dsh-daily-push');
+  if (!deps.length) return [];
+  return ['【已装插件】' + deps.slice(0, 24).join(' · ')];
+}
+
+/** 工作区摘要：每个顶层目录一行，md 带标题，最后附依赖。 */
+function digestWorkspace(root, settings) {
+  if (!root || !fs.existsSync(root)) return [];
+  const scanned = scanWorkspaceFiles(root, settings.maxFiles);
+  const lines = [];
+  lines.push('【工作区】' + path.basename(root) + '  近 ' + scanned.files.length + ' 个文件 / ' + scanned.dirs + ' 个目录');
+  if (scanned.scanned > scanned.files.length) {
+    lines.push('  （另有 ' + (scanned.scanned - scanned.files.length) + ' 个较旧的文件未列入）');
+  }
+
+  const tops = new Map();
+  for (const f of scanned.files) {
+    const top = f.rel.includes('/') ? f.rel.split('/')[0] : '(根目录)';
+    if (!tops.has(top)) tops.set(top, []);
+    tops.get(top).push(f);
+  }
+  const order = [...tops.entries()].sort((a, b) => b[1].length - a[1].length).slice(0, 12);
+  for (const entry of order) {
+    const top = entry[0];
+    const list = entry[1];
+    lines.push('  ' + top + '/  ' + list.length + ' 个文件');
+    const docs = list.filter((f) => f.ext === '.md' || f.ext === '.markdown' || f.ext === '.txt').slice(0, 2);
+    for (const f of docs) {
+      const abs = path.join(root, f.rel.split('/').join(path.sep));
+      const heads = mdHeads(abs);
+      lines.push('    · ' + shortName(f.rel) + (heads.length ? '  ' + heads.join(' / ') : ''));
+    }
+    const pkgs = list.filter((f) => f.rel.endsWith('package.json')).slice(0, 1);
+    for (const f of pkgs) {
+      try {
+        const doc = JSON.parse(fs.readFileSync(path.join(root, f.rel.split('/').join(path.sep)), 'utf8'));
+        const deps = Object.keys(doc.dependencies || {}).slice(0, 8);
+        if (deps.length) lines.push('    · ' + shortName(f.rel) + ' 依赖: ' + deps.join(', '));
+      } catch (err) {
+        /* 坏 json 忽略 */
+      }
+    }
+  }
+  return lines;
+}
+
+/** 看板摘要：任务标题 + 状态；描述不带上。 */
+function digestBoard() {
+  const file = path.join(dataHome(), 'storages', 'dsh_task_board', 'documents', 'board.json');
+  let doc = null;
+  try { doc = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (err) { return []; }
+  const tasks = (doc && doc.record && Array.isArray(doc.record.tasks)) ? doc.record.tasks : [];
+  if (!tasks.length) return [];
+  const count = {};
+  for (const t of tasks) count[t.status] = (count[t.status] || 0) + 1;
+  const bits = Object.keys(count).map((k) => k + ' ' + count[k]).join(' · ');
+  const lines = ['【看板】' + tasks.length + ' 项（' + bits + '）'];
+  const live = tasks
+    .filter((t) => t.status !== 'done' && t.status !== 'archived')
+    .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))
+    .slice(0, 8);
+  for (const t of live) {
+    const title = String(t.title || '').trim();
+    if (!title) continue;
+    lines.push('  · ' + title.slice(0, 60) + '  [' + String(t.status || '?') + ']');
+  }
+  return lines;
+}
+
+/** 会话摘要：只读标题 + 工作目录 + 日期，不碰正文。 */
+function digestSessions(limit) {
+  const dir = path.join(dataHome(), 'storages', 'session_projcache', 'sessions');
+  let names = null;
+  try { names = fs.readdirSync(dir); } catch (err) { return []; }
+  const rows = [];
+  for (const name of names) {
+    if (!name.endsWith('.json')) continue;
+    const abs = path.join(dir, name);
+    try {
+      rows.push({ abs, mtime: fs.statSync(abs).mtimeMs });
+    } catch (err) {
+      /* ignore */
+    }
+  }
+  rows.sort((a, b) => b.mtime - a.mtime);
+  const take = rows.slice(0, Math.max(1, Math.min(60, Number(limit) || 20)));
+  const out = [];
+  for (const row of take) {
+    try {
+      const doc = JSON.parse(fs.readFileSync(row.abs, 'utf8'));
+      const rec = (doc && doc.record) ? doc.record : {};
+      const titleRow = (rec.rows && rec.rows.title) ? rec.rows.title.val : '';
+      const title = String(titleRow || '').replace(/^#+\s*/, '').trim();
+      if (!title) continue;
+      const cwd = rec.identity && rec.identity.cwd ? String(rec.identity.cwd) : '';
+      const base = cwd ? path.basename(cwd) : '';
+      const when = new Date(row.mtime);
+      const stamp = (when.getMonth() + 1) + '-' + String(when.getDate()).padStart(2, '0');
+      out.push('  · ' + title.slice(0, 40) + (base ? '  · ' + base : '') + '  · ' + stamp);
+    } catch (err) {
+      /* 坏文件跳过 */
+    }
+  }
+  if (!out.length) return [];
+  return ['【会话】最近 ' + out.length + ' 个'].concat(out);
+}
+
+
+/** 拼成一段摘要；超预算就从末尾的会话段开始砍。 */
+function buildDigest(options) {
+  const settings = scanSettings();
+  const root = (options && options.cwd) ? String(options.cwd) : (latestWorkspaceDir() || '');
+  const parts = [];
+  if (settings.scanWorkspace !== false && root) parts.push(digestWorkspace(root, settings));
+  parts.push(digestInstalled());
+  if (settings.scanBoard !== false) parts.push(digestBoard());
+  if (settings.scanSessions !== false) parts.push(digestSessions(settings.sessionBody ? 40 : 20));
+  const picked = (options && Array.isArray(options.sessions)) ? options.sessions : [];
+  if (picked.length) parts.push(digestSessionBodies(picked, settings.sessionBodyChars));
+  const lines = [];
+  for (const part of parts) for (const line of part) lines.push(line);
+  const capChars = SCAN_MAX_CHARS + (picked.length ? Math.min(40000, Number(settings.sessionBodyChars) || SESSION_BODY_CHARS) : 0);
+  let text = lines.join('\n');
+  while (text.length > capChars && lines.length > 3) {
+    lines.pop();
+    text = lines.join('\n');
+  }
+  return text;
+}
+
+/** 最近一个会话的工作目录，当作「当前工作区」。 */
+function latestWorkspaceDir() {
+  const dir = path.join(dataHome(), 'storages', 'session_projcache', 'sessions');
+  let names = null;
+  try { names = fs.readdirSync(dir); } catch (err) { return ''; }
+  const rows = [];
+  for (const name of names) {
+    if (!name.endsWith('.json')) continue;
+    const abs = path.join(dir, name);
+    try { rows.push({ abs, mtime: fs.statSync(abs).mtimeMs }); } catch (err) { /* ignore */ }
+  }
+  rows.sort((a, b) => b.mtime - a.mtime);
+  for (const row of rows.slice(0, 30)) {
+    try {
+      const doc = JSON.parse(fs.readFileSync(row.abs, 'utf8'));
+      const cwd = (doc && doc.record && doc.record.identity) ? String(doc.record.identity.cwd || '') : '';
+      if (cwd && fs.existsSync(cwd)) return cwd;
+    } catch (err) {
+      /* ignore */
+    }
+  }
+  return '';
+}
+
+function handleScan(request) {
+  const url = new URL(request.url, 'http://dsh.local');
+  const force = url.searchParams.get('force') === '1';
+  if (url.searchParams.get('meta') === '1') {
+    const settings = scanSettings();
+    return jsonResponse({ ok: true, settings, registered: !!scanSettingsScope });
+  }
+  const queried = String(url.searchParams.get('cwd') || '');
+  const sessions = String(url.searchParams.get('sessions') || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter((s) => s.startsWith('session-'))
+    .slice(0, 3);
+  const settings = scanSettings();
+  const cwd = queried || latestWorkspaceDir();
+  const ttl = Math.max(1, Number(settings.refreshHours) || 12) * 3600 * 1000;
+  const now = Date.now();
+
+  if (!force) {
+    const cached = readScanDisk();
+    const samePick = cached && Array.isArray(cached.sessions) && cached.sessions.join(',') === sessions.join(',');
+    if (cached && now - Number(cached.at) < ttl && (!cwd || cached.cwd === cwd) && samePick) {
+      return jsonResponse({ ...cached, cached: true });
+    }
+  }
+
+  const text = buildDigest({ cwd, sessions });
+  const doc = {
+    ok: true,
+    at: now,
+    cwd,
+    text,
+    chars: text.length,
+    ttlMs: ttl,
+    sessions,
+    settings: {
+      workspace: settings.scanWorkspace !== false,
+      board: settings.scanBoard !== false,
+      sessions: settings.scanSessions !== false,
+      body: settings.sessionBody === true,
+    },
+  };
+  writeScanDisk(doc);
+  return jsonResponse({ ...doc, cached: false });
+}
+
+export const __scanTest = {
+  buildDigest, digestWorkspace, digestBoard, digestSessions, scanWorkspaceFiles, latestWorkspaceDir,
+};
+
+
+// ── 会话正文（用户勾选后按需读）─────────────────────────────────────────────
+//
+// 会话文件是 session.v4.jsonl.zstd：一个事件一行 JSON，**每写一次就追加一个 zstd 帧**，
+// 所以 zlib 的一次性解压只能拿到第一帧；这里自己数帧头、逐帧解，再拼起来。
+
+const ZSTD_MAGIC = 0xFD2FB528;
+const SESSION_MAX_BYTES = 80 * 1024 * 1024;
+const SESSION_BODY_CHARS = 12000;
+
+/** 算一个 zstd 帧占多少字节（只读帧头与块头，不解压）。 */
+function zstdFrameLength(buf, off) {
+  if (off + 5 > buf.length) return -1;
+  if (buf.readUInt32LE(off) !== ZSTD_MAGIC) return -1;
+  let p = off + 4;
+  const fhd = buf[p];
+  p += 1;
+  const fcsFlag = fhd >> 6;
+  const single = (fhd >> 5) & 1;
+  const checksum = (fhd >> 2) & 1;
+  const dictFlag = fhd & 3;
+  if (!single) p += 1;
+  p += [0, 1, 2, 4][dictFlag];
+  if (fcsFlag === 0) {
+    if (single) p += 1;
+  } else {
+    p += [0, 2, 4, 8][fcsFlag];
+  }
+  for (;;) {
+    if (p + 3 > buf.length) return -1;
+    const bh = buf[p] | (buf[p + 1] << 8) | (buf[p + 2] << 16);
+    p += 3;
+    const last = bh & 1;
+    const type = (bh >> 1) & 3;
+    const size = bh >> 3;
+    if (type === 1) p += 1; else p += size;
+    if (last) break;
+  }
+  if (checksum) p += 4;
+  return p - off;
+}
+
+/** 读一个会话的所有事件；坏帧就停在坏帧前，已经读到的照用。 */
+function readSessionEvents(file) {
+  const st = fs.statSync(file);
+  if (st.size > SESSION_MAX_BYTES) return { events: [], truncated: true };
+  const buf = fs.readFileSync(file);
+  let off = 0;
+  const parts = [];
+  while (off < buf.length) {
+    let len = zstdFrameLength(buf, off);
+    if (len <= 0) break;
+    try {
+      parts.push(zlib.zstdDecompressSync(buf.subarray(off, off + len)).toString('utf8'));
+    } catch (err) {
+      break;
+    }
+    off += len;
+  }
+  const events = [];
+  for (const line of parts.join('').split('\n')) {
+    if (line === '') continue;
+    try { events.push(JSON.parse(line)); } catch (err) { /* 半行忽略 */ }
+  }
+  return { events, truncated: false };
+}
+
+/** 宿主注入的脚手架文本不是用户说的话：整段剥掉，免得又长又没用。 */
+function cleanUserText(raw, summaryChars) {
+  let text = String(raw || '');
+  text = text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '');
+  const drop = /^(Current runtime context|Current DSH file policy|Current working directory:|Current DeepSeek Harness|Browser time zone|Approval policy|Time sampled while preparing|Elapsed since the preceding)/i;
+  const lines = [];
+  for (const line of text.split(/\r?\n/)) {
+    if (drop.test(line.trim())) continue;
+    lines.push(line);
+  }
+  text = lines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+  if (text.startsWith('[Compressed conversation section]')) {
+    const keep = Math.max(120, Number(summaryChars) || SCAN_DEFAULTS.summaryChars);
+    if (text.length > keep) text = text.slice(0, keep) + '…';
+  }
+  return text;
+}
+
+function textOfContent(content) {
+  if (!Array.isArray(content)) return '';
+  const bits = [];
+  for (const item of content) {
+    if (!item || item.type !== 'text') continue;
+    const t = String(item.text || '').trim();
+    if (t) bits.push(t);
+  }
+  return bits.join('\n');
+}
+
+/** 会话里 id → 文件路径。141 个文件，扫一次 60 秒内复用。 */
+const sessionIndexCache = { at: 0, map: null };
+
+function sessionIndex() {
+  const now = Date.now();
+  if (sessionIndexCache.map !== null && now - sessionIndexCache.at < 60 * 1000) return sessionIndexCache.map;
+  const map = new Map();
+  const root = path.join(dataHome(), 'sessions');
+  let wsList = null;
+  try { wsList = fs.readdirSync(root); } catch (err) { wsList = []; }
+  for (const ws of wsList) {
+    const wsDir = path.join(root, ws);
+    let ids = null;
+    try { ids = fs.readdirSync(wsDir); } catch (err) { continue; }
+    for (const sid of ids) {
+      if (!sid.startsWith('session-')) continue;
+      const file = path.join(wsDir, sid, 'session.v4.jsonl.zstd');
+      let st = null;
+      try { st = fs.statSync(file); } catch (err) { continue; }
+      map.set(sid, { id: sid, file, ws, size: st.size, mtime: st.mtimeMs });
+    }
+  }
+  sessionIndexCache.at = now;
+  sessionIndexCache.map = map;
+  return map;
+}
+
+/** 把一个会话压成「我：… / 助手：…」的正文，助手只留开头，省预算。 */
+function sessionTranscript(id, budget) {
+  const idx = sessionIndex();
+  const hit = idx.get(id);
+  if (!hit) return null;
+  const cap = Math.max(1000, Math.min(40000, Number(budget) || SESSION_BODY_CHARS));
+  const conf = scanSettings();
+  const assistantChars = Math.max(0, Math.min(4000, Number(conf.assistantChars) || 0));
+  let events = [];
+  try {
+    events = readSessionEvents(hit.file).events;
+  } catch (err) {
+    return { id, error: 'read_failed', text: '' };
+  }
+  let title = '';
+  let cwd = '';
+  let turns = 0;
+  const lines = [];
+  let used = 0;
+  for (const ev of events) {
+    if (ev.type === 'session') {
+      if (ev.cwd) cwd = String(ev.cwd);
+      continue;
+    }
+    if (ev.type === 'session/title' && ev.data && ev.data.title) {
+      title = String(ev.data.title);
+      continue;
+    }
+    if (ev.type === 'user/message') {
+      const text = cleanUserText(textOfContent(ev.data && ev.data.content), conf.summaryChars);
+      if (!text || text.length < 4) continue;
+      turns += 1;
+      const line = '我：' + text;
+      if (used + line.length > cap) break;
+      used += line.length + 1;
+      lines.push(line);
+      continue;
+    }
+    if (ev.type === 'assistant/message') {
+      const text = textOfContent(ev.data && ev.data.message && ev.data.message.content);
+      if (!text) continue;
+      if (!assistantChars) continue;
+      const line = '助手：' + (text.length > assistantChars ? text.slice(0, assistantChars) + '…' : text);
+      if (used + line.length > cap) continue;
+      used += line.length + 1;
+      lines.push(line);
+    }
+  }
+  return { id, title, cwd, turns, text: lines.join('\n'), chars: used, truncated: used >= cap };
+}
+
+/** 勾选的会话列表 → 摘要末尾的那一段。 */
+function digestSessionBodies(ids, budget) {
+  const picked = (ids || []).filter((x) => typeof x === 'string' && x.startsWith('session-')).slice(0, 3);
+  if (!picked.length) return [];
+  const out = ['【本次附带的会话正文】'];
+  let left = Math.max(1000, Math.min(40000, Number(budget) || SESSION_BODY_CHARS));
+  for (const id of picked) {
+    if (left <= 500) break;
+    const got = sessionTranscript(id, left);
+    if (got === null) {
+      out.push('  · ' + id + '（读不到）');
+      continue;
+    }
+    out.push('  · ' + (got.title || id) + '（' + got.turns + ' 轮）');
+    for (const line of String(got.text || '').split('\n')) {
+      if (line === '') continue;
+      out.push('    ' + line);
+    }
+    left -= Number(got.chars) || 0;
+  }
+  return out;
+}
+
+function handleSessions(request) {
+  const url = new URL(request.url, 'http://dsh.local');
+  const limit = Math.max(1, Math.min(50, Number(url.searchParams.get('limit')) || 20));
+  const idx = sessionIndex();
+  const rows = [...idx.values()].sort((a, b) => b.mtime - a.mtime).slice(0, limit);
+  const out = [];
+  for (const row of rows) {
+    let title = '';
+    let cwd = '';
+    try {
+      const doc = JSON.parse(fs.readFileSync(path.join(dataHome(), 'storages', 'session_projcache', 'sessions', row.id + '.json'), 'utf8'));
+      const rec = (doc && doc.record) ? doc.record : {};
+      title = String((rec.rows && rec.rows.title && rec.rows.title.val) || '').replace(/^#+\s*/, '');
+      cwd = String((rec.identity && rec.identity.cwd) || '');
+    } catch (err) { /* 没有缓存就算了 */ }
+    out.push({
+      id: row.id,
+      title: title || '(未命名会话)',
+      cwd,
+      workspace: path.basename(cwd || row.ws),
+      at: row.mtime,
+      size: row.size,
+    });
+  }
+  return jsonResponse({ ok: true, sessions: out });
+}
+
+function handleSessionBody(request) {
+  const url = new URL(request.url, 'http://dsh.local');
+  const id = String(url.searchParams.get('id') || '');
+  const budget = Number(url.searchParams.get('chars')) || SESSION_BODY_CHARS;
+  if (!id.startsWith('session-')) return jsonResponse({ ok: false, error: 'bad_id' }, 400);
+  const got = sessionTranscript(id, budget);
+  if (got === null) return jsonResponse({ ok: false, error: 'not_found' }, 404);
+  return jsonResponse({ ok: true, ...got, budget });
+}
+
 export function apply(ctx) {
+  // 设置页表单：命名空间 'dsh-daily-push'，schema 用 schemastery。
+  ctx.inject(['settings'], (sctx) => {
+    loadSchemaLib().then((z) => {
+      if (z === null) return;
+      try {
+        scanSettingsScope = sctx.settings.register('dsh-daily-push', buildScanSchema(z));
+      } catch (err) {
+        scanSettingsScope = null;
+      }
+    }).catch(() => { scanSettingsScope = null; });
+  });
+
   ctx.inject(['connection', 'llm'], (host) => {
     host.effect(
       () =>
@@ -2406,6 +3352,50 @@ export function apply(ctx) {
           fetch: (request) => handleAllDl(request),
         }),
       'dsh-daily-push: all downloads',
+    );
+
+    host.effect(
+      () =>
+        host.connection.fetch.register({
+          path: SUGGEST_PATH,
+          methods: ['POST'],
+          requestBody: 'buffered',
+          fetch: (request) => handleSuggest(host, request),
+        }),
+      'dsh-daily-push: suggest',
+    );
+
+    host.effect(
+      () =>
+        host.connection.fetch.register({
+          path: SCAN_PATH,
+          methods: ['GET'],
+          requestBody: 'buffered',
+          fetch: (request) => handleScan(request),
+        }),
+      'dsh-daily-push: scan',
+    );
+
+    host.effect(
+      () =>
+        host.connection.fetch.register({
+          path: SESSIONS_PATH,
+          methods: ['GET'],
+          requestBody: 'buffered',
+          fetch: (request) => handleSessions(request),
+        }),
+      'dsh-daily-push: sessions',
+    );
+
+    host.effect(
+      () =>
+        host.connection.fetch.register({
+          path: SESSION_BODY_PATH,
+          methods: ['GET'],
+          requestBody: 'buffered',
+          fetch: (request) => handleSessionBody(request),
+        }),
+      'dsh-daily-push: session body',
     );
 
     host.effect(

@@ -1905,7 +1905,8 @@ window.__ModuleLoader__.load({
         style.id = 'ddp-css';
         document.head.appendChild(style);
       }
-      style.textContent = CSS + REF_CSS + WATCH_CSS + BADGE_CSS + DENSE_CSS + ZH_CSS + ALL_CSS;
+      style.textContent =
+        CSS + REF_CSS + WATCH_CSS + BADGE_CSS + DENSE_CSS + ZH_CSS + ALL_CSS + SUGGEST_CSS + CONSULT_CSS;
     }
 
     const FRAME_MODE = (function () {
@@ -2223,6 +2224,54 @@ window.__ModuleLoader__.load({
         return () => searchListeners.delete(setV);
       }, []);
       return v;
+    }
+
+    /* ───────────────────────── 咨询页：面板内切页 ───────────────────────── */
+
+    /* 用户要求「全部在插件里做，不单独开页面」：搜索框常驻在顶上，
+       点「问模型」就在同一块面板里切到咨询页，返回时搜索词和滚动位置都还在。
+       状态放模块级，四个版式共用一份，切换版式不会丢。 */
+    const CONSULT_QUICK = ['这周有什么值得装的', '能干什么', '有什么坑', '和我装的重复吗', '有没有替代品'];
+
+    let consultOpen = false;
+    let consultSeed = '';
+    const consultListeners = new Set();
+
+    function setConsult(open, seed) {
+      const nextOpen = !!open;
+      const nextSeed = seed == null ? consultSeed : String(seed);
+      if (nextOpen === consultOpen && nextSeed === consultSeed) return;
+      consultOpen = nextOpen;
+      consultSeed = nextSeed;
+      consultListeners.forEach((fn) => {
+        try {
+          fn({ open: consultOpen, seed: consultSeed });
+        } catch (err) {
+          /* 单个订阅者出错不影响别的 */
+        }
+      });
+    }
+
+    function useConsult() {
+      const [v, setV] = useState({ open: consultOpen, seed: consultSeed });
+      useEffect(() => {
+        consultListeners.add(setV);
+        setV({ open: consultOpen, seed: consultSeed });
+        return () => consultListeners.delete(setV);
+      }, []);
+      return v;
+    }
+
+    /* 只用来决定「要不要多给一个问模型按钮」，绝不自动切页——
+       自动切会把「想筛目录」的人硬拽进咨询，反而添乱。 */
+    function looksLikeQuestion(q) {
+      const s = String(q == null ? '' : q).trim();
+      if (!s) return false;
+      if (/^https?:\/\//i.test(s)) return true;
+      if (/^[\w.-]+\/[\w.-]+$/.test(s)) return true;
+      if (/[?？]$/.test(s)) return true;
+      if (/(吗|呢|怎么|能不能|值不值|有没有|哪个|如何|为什么|推荐)/.test(s)) return true;
+      return s.split(/\s+/).length >= 6;
     }
 
     /* ───────────────────────── 场景分类（"不知道搜什么"时的入口） ───────────────────────── */
@@ -2573,7 +2622,8 @@ window.__ModuleLoader__.load({
     /** 排序用三个真信号：发布日期、本周下载量（宿主批量取的）、npm 自己的相关度打分。
      *  npm 搜索返回的 score.detail 在这一批里恒等于 1，所以不能用它排序。 */
     function npmBuckets(items, terms) {
-      const hit = npmFilter(items, terms);
+      /* 官方包在底部「官方仓库」卡里，这里不再出现 */
+      const hit = npmFilter(items, terms).filter((p) => !isOfficialRow(p));
       const by = (fn) => hit.slice().sort(fn).slice(0, 15);
       const dl = (p) => Number(p && p.downloads) || 0;
       const rel = (p) => Number(p && p.relevance) || 0;
@@ -2685,6 +2735,365 @@ window.__ModuleLoader__.load({
     const A_STEP = 15;
     const allStore = new Map();
 
+
+    /* ── 猜你喜欢：本地扫描 → 画像 → 目录检索 ───────────────────────────
+       模型只出「缺什么能力 + 英文关键词」，插件由本地目录检索给出，
+       所以不会推荐不存在的包；检索不到的需求直接不显示（宁缺勿滥）。 */
+    const SUGGEST_URL = '/api/daily-consult.suggest';
+    const SESSIONS_URL = '/api/daily-consult.sessions';
+    const SCAN_URL = '/api/daily-consult.scan';
+    const PICK_KEY = 'ddp.sess.pick';
+    const DISMISS_KEY = 'ddp.sug.dismiss';
+
+    function readPick() {
+      try {
+        const v = JSON.parse(localStorage.getItem(PICK_KEY) || '[]');
+        return Array.isArray(v) ? v.filter((x) => typeof x === 'string').slice(0, 3) : [];
+      } catch (e) {
+        return [];
+      }
+    }
+
+    function writePick(list) {
+      try {
+        localStorage.setItem(PICK_KEY, JSON.stringify((list || []).slice(0, 3)));
+      } catch (e) {
+        /* 隐私模式下写不了，忽略 */
+      }
+    }
+
+    function readDismiss() {
+      try {
+        const v = JSON.parse(localStorage.getItem(DISMISS_KEY) || '{}');
+        return v && typeof v === 'object' ? v : {};
+      } catch (e) {
+        return {};
+      }
+    }
+
+    function writeDismiss(map) {
+      try {
+        localStorage.setItem(DISMISS_KEY, JSON.stringify(map || {}));
+      } catch (e) {
+        /* ignore */
+      }
+    }
+
+    /** 最近会话清单（标题 + 工作区 + 大小），只读，用于勾选。 */
+    function useSessions(active) {
+      const [st, setSt] = useState({ status: 'idle', items: [] });
+      useEffect(() => {
+        if (!active) return undefined;
+        let dead = false;
+        fetch(SESSIONS_URL + '?limit=24')
+          .then((r) => r.json())
+          .then((j) => {
+            if (!dead) setSt({ status: 'ready', items: (j && j.sessions) || [] });
+          })
+          .catch(() => {
+            if (!dead) setSt({ status: 'error', items: [] });
+          });
+        return () => {
+          dead = true;
+        };
+      }, [active]);
+      return st;
+    }
+
+    /** 全量目录 → 一个扁平的候选池（G 与 N 归一，G 优先）。 */
+    function suggestPool(ghItems, npmItems) {
+      const out = [];
+      const seen = {};
+      for (const r of ghItems || []) {
+        if (!r) continue;
+        const row = denseRow(r);
+        const key = allKeyOf(row);
+        if (!key || seen[key]) continue;
+        if (!looksLikeDshPlugin(row)) continue;
+        if (isOfficialRow(row)) continue;
+        seen[key] = 1;
+        out.push(Object.assign({}, row, { badge: 'G' }));
+      }
+      for (const p of npmItems || []) {
+        if (!p || !p.name) continue;
+        if (isOfficialRow(p)) continue;
+        const key = allKeyOf(p);
+        if (!key || seen[key]) continue;
+        seen[key] = 1;
+        out.push(
+          Object.assign({}, p, {
+            badge: 'N',
+            url: p.repoUrl || p.npmUrl || 'https://www.npmjs.com/package/' + p.name,
+          }),
+        );
+      }
+      return out;
+    }
+
+    /** 需求 → 候选池检索：每条需求最多 per 个，跨需求去重，命中不了的需求直接丢掉。 */
+    function matchNeeds(needs, pool, opts) {
+      const limit = (opts && opts.limit) || 5;
+      const per = (opts && opts.per) || 2;
+      const skip = (opts && opts.skip) || {};
+      const used = {};
+      const out = [];
+      for (const need of needs || []) {
+        if (!need) continue;
+        const keys = Array.isArray(need.keys) ? need.keys.join(' ') : String(need.keys || '');
+        if (!keys.trim()) continue;
+        const terms = searchTerms(keys);
+        const scored = [];
+        for (const row of pool || []) {
+          if (!row || !row.fullName || used[row.fullName]) continue;
+          if (skip[row.fullName]) continue;
+          const score = matchScore(row, terms);
+          if (score > 0) scored.push({ row, score });
+        }
+        if (!scored.length) continue;
+        scored.sort((a, b) => b.score - a.score);
+        const rows = scored.slice(0, per).map((x) => x.row);
+        for (const r of rows) used[r.fullName] = 1;
+        out.push({ title: String(need.title || '').slice(0, 24), why: String(need.why || '').slice(0, 60), rows });
+        if (out.length >= limit) break;
+      }
+      return out;
+    }
+
+    /** 画像：POST 一次，宿主侧扫本机 → 问模型 → 回 5-6 条需求。 */
+    function useSuggest(active, reloadKey, sessions) {
+      const [st, setSt] = useState({ status: 'idle', needs: [], mode: '', at: 0, chars: 0, error: '', model: '' });
+      const key = (sessions || []).join(',');
+      useEffect(() => {
+        if (!active) return undefined;
+        let dead = false;
+        setSt((s) => Object.assign({}, s, { status: 'loading' }));
+        fetch(SUGGEST_URL, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ sessions: sessions || [], force: reloadKey > 0 }),
+        })
+          .then((r) => r.json())
+          .then((j) => {
+            if (dead) return;
+            if (!j || j.ok === false) {
+              setSt({ status: 'error', needs: [], mode: '', at: 0, chars: 0, error: (j && j.error) || 'fail', model: '' });
+              return;
+            }
+            setSt({
+              status: 'ready',
+              needs: j.needs || [],
+              mode: j.mode || '',
+              at: Number(j.at) || Date.now(),
+              chars: Number(j.chars) || 0,
+              error: '',
+              model: j.model || '',
+            });
+          })
+          .catch(() => {
+            if (!dead) setSt({ status: 'error', needs: [], mode: '', at: 0, chars: 0, error: 'network', model: '' });
+          });
+        return () => {
+          dead = true;
+        };
+      }, [active, reloadKey, key]);
+      return st;
+    }
+
+    const SUG_ERR = {
+      network: '连不上宿主，稍后再试',
+      fail: '画像没取到',
+      no_needs: '模型没给出可用建议',
+      '拿不到默认模型': '这台机器没接上模型',
+    };
+
+    function SuggestRow(props) {
+      const r = props.row;
+      const name = r.displayName || r.name || r.fullName;
+      return h(
+        'div',
+        { className: 'sg-row' },
+        h(
+          'a',
+          { className: 'sg-name', href: r.url, target: '_blank', rel: 'noreferrer', title: r.description || name },
+          name,
+          r.badge === 'N' ? h('i', { className: 'dsk-sb' }, 'N') : null,
+          r.stars ? h('span', { className: 'sg-star' }, fmtStars(r.stars)) : null,
+        ),
+        h('button', { className: 'dsk-cp', title: '复制安装命令', onClick: () => copyText(installCmd(r)) }, '装'),
+        h('button', { className: 'sg-no', title: '不感兴趣（本地记住）', onClick: () => props.onDismiss(r.fullName) }, '×'),
+      );
+    }
+
+    /** 「猜你喜欢」块：跟榜单同一套卡片（.dsk-col），命中行也用同一套行（.dsk-row），
+     *  这样图、描述、星数、装/关注的位置都跟左边三列对齐，不用再学一套排版。 */
+    function SuggestPanel(props) {
+      const st = props.st;
+      const rows = props.rows || [];
+      const busy = st.status === 'loading';
+      const total = rows.reduce((n, x) => n + ((x.rows || []).length), 0);
+      const basis =
+        st.status === 'ready'
+          ? '扫了 ' + (st.chars || 0).toLocaleString('zh-CN') + ' 字' +
+            (st.mode === 'popular' ? ' · 模型不可用，用的热门方向兜底' : '') + ' · ' + hhmm(st.at)
+          : st.status === 'error'
+            ? '没取到画像：' + (SUG_ERR[st.error] || st.error)
+            : '正在看你的工作区、看板与会话…';
+      const body = busy
+        ? h('div', { className: 'dsk-empty' }, '第一次要扫一遍本机，约 1-2 秒…')
+        : st.status === 'error'
+          ? h('div', { className: 'dsk-empty' }, '画像失败：' + (SUG_ERR[st.error] || st.error))
+          : !rows.length
+            ? h('div', { className: 'dsk-empty' }, st.needs && st.needs.length ? '推出来的方向在目录里没找到对得上的，宁缺勿滥。' : '暂时没有建议。')
+            : rows.map((need, i) =>
+                h(
+                  'div',
+                  { key: i, className: 'sg-need' },
+                  h(
+                    'div',
+                    { className: 'sg-nh' },
+                    h('b', null, need.title),
+                    need.why ? h('s', null, need.why) : null,
+                  ),
+                  (need.rows || []).map((r, j) =>
+                    h(DenseRowView, {
+                      key: r.fullName,
+                      p: r,
+                      idx: j,
+                      via: r.badge === 'N' ? 'npm' : 'gh',
+                      metric: r.badge === 'N' ? npmNum(r.downloads) : '★' + fmtStars(r.stars),
+                      zh: props.zh,
+                      watched: props.watched,
+                      onWatch: props.onWatch,
+                      onDismiss: props.onDismiss,
+                    }),
+                  ),
+                ),
+              );
+      return h(
+        'section',
+        { className: 'dsk-col dsk-sug' },
+        h(
+          'div',
+          { className: 'dsk-ch' },
+          h('h2', null, '猜你喜欢'),
+          h('span', { className: 'k' }, 'by 本机画像'),
+          h('span', { className: 'c' }, String(total)),
+          h('button', { className: 'dsk-btn sg-refresh', disabled: busy, onClick: props.onRefresh }, busy ? '…' : '换一批'),
+        ),
+        h('div', { className: 'dsk-body' }, h('div', { className: 'sg-basis' }, basis), body),
+        h('div', { className: 'sg-foot' }, '只发结构摘要（文件名/标题/依赖名），不发正文'),
+      );
+    }
+
+    /** ⚙ 里的扫描设置：勾会话 + 看这次会发什么。 */
+    function ScanBox(props) {
+      const sess = useSessions(true);
+      const [open, setOpen] = useState(false);
+      const [pv, setPv] = useState('');
+      const [busy, setBusy] = useState(false);
+      const pick = props.pick || [];
+
+      const toggle = (id) => {
+        const next = pick.indexOf(id) >= 0 ? pick.filter((x) => x !== id) : pick.concat([id]).slice(0, 3);
+        props.onChange(next);
+      };
+
+      const preview = () => {
+        setBusy(true);
+        setPv('正在扫…');
+        fetch(SUGGEST_URL, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ preview: true, sessions: pick }),
+        })
+          .then((r) => r.json())
+          .then((j) => {
+            setBusy(false);
+            setPv(j && j.ok ? j.digest : '预览失败：' + ((j && j.error) || '未知'));
+          })
+          .catch(() => {
+            setBusy(false);
+            setPv('预览失败：连不上宿主');
+          });
+      };
+
+      return h(
+        'div',
+        { className: 'dsk-token dsk-scan' },
+        h(
+          'div',
+          { className: 'tk-h' },
+          h('b', null, '猜你喜欢的数据来源'),
+          h('span', { className: 'tk-s' }, pick.length ? '已勾 ' + pick.length + ' 个会话' : '默认只扫工作区标题，不带正文'),
+          h('button', { className: 'dsk-btn', onClick: () => setOpen(!open) }, open ? '收起' : '设置'),
+        ),
+        open
+          ? h(
+              'div',
+              { className: 'tk-in tk-col' },
+              h('div', { className: 'tk-note' }, '扫描范围、刷新间隔、会话正文字数在「设置 → 插件 → 每日推送」里改。下面只挑这次带哪几个会话的正文。'),
+              sess.status === 'loading'
+                ? h('div', { className: 'tk-note' }, '读会话清单…')
+                : sess.items.slice(0, 12).map((s) =>
+                    h(
+                      'label',
+                      { key: s.id, className: 'sg-pick' },
+                      h('input', { type: 'checkbox', checked: pick.indexOf(s.id) >= 0, onChange: () => toggle(s.id) }),
+                      h('span', { className: 'sg-pt' }, s.title || s.id.slice(0, 12)),
+                      h('span', { className: 'sg-pw' }, (s.workspace || '') + ' · ' + Math.round((s.size || 0) / 1024) + 'KB'),
+                    ),
+                  ),
+              h(
+                'div',
+                { className: 'tk-in' },
+                h('button', { className: 'dsk-btn', disabled: busy, onClick: preview }, busy ? '…' : '看看这次会发什么'),
+                h('span', { className: 'tk-note' }, '最多勾 3 个'),
+              ),
+              pv ? h('pre', { className: 'sg-pv' }, pv) : null,
+            )
+          : null,
+      );
+    }
+
+    const SUGGEST_CSS =
+      /* 「猜你喜欢」整块就是一根 .dsk-col，行是 .dsk-row：跟左边三列一模一样，只是内容来路不同 */
+      /* basis 用 0 而不是 auto：auto 会按内容（十组需求两千多像素）去抢高度，把下面「我关注的」压没 */
+      '.dsk-sug{flex:1 1 0;min-height:0}' +
+      '.dsk-sug .dsk-ch{position:sticky;top:0;z-index:2;background:var(--dsk-card)}' +
+      '.dsk-sug .sg-refresh{margin-left:6px;padding:1px 6px;font-size:calc(9px*var(--dsk-fs))}' +
+      '.sg-basis{padding:4px 9px 3px;font-size:calc(9.2px*var(--dsk-fs));color:var(--dsk-dim);line-height:1.45}' +
+      '.sg-need{display:flex;flex-direction:column}' +
+      '.sg-nh{display:flex;align-items:baseline;gap:6px;padding:6px 9px 2px;margin-top:2px;' +
+      '  border-top:1px solid rgba(128,128,128,.14)}' +
+      '.sg-nh b{font-size:calc(10.6px*var(--dsk-fs));font-weight:700;flex:0 0 auto}' +
+      '.sg-nh s{text-decoration:none;min-width:0;font-size:calc(9px*var(--dsk-fs));color:var(--dsk-dim);' +
+      '  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}' +
+      '.dsk-sug .sg-foot{padding:3px 9px 5px;font-size:calc(8.8px*var(--dsk-fs));color:var(--dsk-dim)}' +
+      '.dsk-no{background:none;border:0;color:inherit;opacity:.4;cursor:pointer;font-size:calc(11px*var(--dsk-fs));' +
+      '  line-height:1;padding:0 1px;margin-left:2px}' +
+      '.dsk-no:hover{opacity:.95}' +
+      '.sg-h{display:flex;align-items:baseline;gap:6px}' +
+      '.sg-h b{font-size:13px}' +
+      '.sg-sub{flex:1 1 auto;font-size:11px;opacity:.6}' +
+      '.sg-basis{font-size:11px;opacity:.6}' +
+      '.sg-body{overflow:auto;display:flex;flex-direction:column;gap:8px;min-height:0}' +
+      '.sg-empty{font-size:12px;opacity:.6;padding:6px 0}' +
+      '.sg-need{display:flex;flex-direction:column;gap:2px}' +
+      '.sg-t{font-size:12px;font-weight:600}' +
+      '.sg-w{font-size:11px;opacity:.6;line-height:1.35}' +
+      '.sg-row{display:flex;align-items:center;gap:6px;font-size:12px;padding:1px 0}' +
+      '.sg-name{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:inherit;text-decoration:none}' +
+      '.sg-name:hover{text-decoration:underline}' +
+      '.sg-star{font-size:11px;opacity:.6;margin-left:4px}' +
+      '.sg-no{background:none;border:0;color:inherit;opacity:.45;cursor:pointer;font-size:12px;padding:0 2px}' +
+      '.sg-no:hover{opacity:.9}' +
+      '.sg-foot{font-size:10px;opacity:.45}' +
+      '.dsk-scan .tk-col{gap:4px}' +
+      '.sg-pick{display:flex;align-items:center;gap:6px;font-size:12px;padding:2px 0;cursor:pointer}' +
+      '.sg-pt{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}' +
+      '.sg-pw{font-size:11px;opacity:.55;white-space:nowrap}' +
+      '.sg-pv{max-height:220px;overflow:auto;font-size:11px;line-height:1.4;white-space:pre-wrap;margin:0;padding:6px;border-radius:6px;background:rgba(128,128,128,.1)}';
+
     function useAllData(reloadKey, active) {
       const [st, setSt] = useState({ status: 'loading', gh: null, npm: null, fetchedAt: 0, hasToken: false, error: null });
       useEffect(() => {
@@ -2767,13 +3176,16 @@ window.__ModuleLoader__.load({
     function mergeAll(ghItems, npmItems, terms, opts) {
       const t = Array.isArray(terms) && terms.length ? terms : null;
       const dl = (opts && opts.dl) || null;
+      /* 官方仓库单独在底部一张卡里，任何列都不该再混进来 */
       const ghRows = (Array.isArray(ghItems) ? ghItems : [])
         .map((r) => denseRow(r))
         .filter(Boolean)
-        .filter((r) => looksLikeDshPlugin(r));
+        .filter((r) => looksLikeDshPlugin(r))
+        .filter((r) => !isOfficialRow(r));
       const npmRows = (Array.isArray(npmItems) ? npmItems : [])
         .map((p) => (p && p.fullName ? p : denseRow(p) || p))
-        .filter((p) => p && p.fullName);
+        .filter((p) => p && p.fullName)
+        .filter((p) => !isOfficialRow(p));
       const passGh = (r) => !t || matchScore(r, t) > 0;
       const passNpm = (p) => !t || matchScore(p, t) >= 0.35;
 
@@ -2885,6 +3297,23 @@ window.__ModuleLoader__.load({
       return '数据截至 ' + hhmm(n) + ' · ' + agoHours(n);
     }
 
+    /* 咨询页：整块面板切页用（不进 dsk-main 的三列网格） */
+    const CONSULT_CSS = `
+      .dsk-consult{display:flex;flex-direction:column;gap:8px;flex:1 1 auto;min-height:0;overflow:auto;padding:2px 2px 8px;}
+      .dsk-consult-h{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:12px;}
+      .dsk-back{border:1px solid rgba(128,128,128,.4);background:transparent;color:inherit;border-radius:6px;
+        padding:2px 10px;cursor:pointer;font:inherit;font-size:12px;}
+      .dsk-back:hover{border-color:currentColor;}
+      .dsk-consult-t{font-weight:600;}
+      .dsk-consult-s{opacity:.6;}
+      .dsk-consult .fr-askcol{flex:1 1 auto;min-height:0;border:1px solid rgba(128,128,128,.28);border-radius:8px;}
+      .dsk-consult .fr-ask-b{min-height:0;}
+      .dsk-consult .fr-ask-ta{min-height:96px;}
+      .dsk-consult .fr-ans{max-height:none;overflow:auto;}
+      .dsk-askhint{margin-top:6px;font-size:11px;opacity:.62;}
+      .dsk-askhint button{border:0;background:transparent;color:inherit;text-decoration:underline;cursor:pointer;font:inherit;font-size:11px;padding:0 2px;}
+    `;
+
     const ALL_CSS = `
 .dsk-sb{font-style:normal;font-size:calc(8.4px*var(--dsk-fs));font-weight:700;letter-spacing:.04em;
   padding:0 3px;margin-left:4px;border-radius:3px;border:1px solid currentColor;opacity:.5;vertical-align:1px}
@@ -2905,6 +3334,10 @@ window.__ModuleLoader__.load({
 .dsk-token .tk-in input{flex:1;min-width:0;font:inherit;font-size:calc(10.2px*var(--dsk-fs));padding:2px 6px;
   border:1px solid rgba(128,128,128,.35);border-radius:5px;background:transparent;color:inherit;outline:none}
 .dsk-token .tk-note{font-size:calc(9.4px*var(--dsk-fs));opacity:.8}
+.dsk-ln{display:inline-flex;gap:2px;margin-left:5px;vertical-align:1px}
+.dsk-lk{display:inline-block;padding:0 2px;border:1px solid currentColor;border-radius:3px;
+  font-size:calc(8.2px*var(--dsk-fs));line-height:1.35;opacity:.42;text-decoration:none;color:inherit}
+.dsk-lk:hover{opacity:.9;background:rgba(128,128,128,.14)}
 `;
 
     /** 「显示到第 n 条」的纯逻辑：一次 15 条，到底就 more=false、left=0。
@@ -2943,6 +3376,7 @@ window.__ModuleLoader__.load({
                   key: String(p.fullName || p.name) + ':' + i,
                   p,
                   idx: i,
+                  via: props.via,
                   metric: props.metric(p),
                   zh: props.zh,
                   watched: props.watched,
@@ -3089,7 +3523,17 @@ window.__ModuleLoader__.load({
     const SB_CLEAR = { border: 'none', background: 'transparent', cursor: 'pointer', fontSize: 16, lineHeight: 1, opacity: 0.6, color: 'inherit', padding: 0 };
     const SB_CHIPS = { display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 6, fontSize: 11, opacity: 0.75 };
     const SB_CHIP = { border: '1px solid rgba(128,128,128,.35)', background: 'transparent', color: 'inherit', borderRadius: 999, padding: '1px 8px', cursor: 'pointer', fontSize: 11, fontFamily: 'inherit', opacity: 0.9 };
-    const SB_HINT = { opacity: 0.6 };
+    const SB_HINT = { opacity: 0.6, marginRight: 2 };
+    const SB_ASK = {
+      border: '1px solid currentColor',
+      background: 'transparent',
+      color: 'inherit',
+      borderRadius: 999,
+      padding: '1px 9px',
+      cursor: 'pointer',
+      fontSize: 11,
+      fontFamily: 'inherit',
+    };
     const SB_CAT = { border: '1px solid rgba(128,128,128,.28)', background: 'transparent', color: 'inherit', borderRadius: 6, padding: '0 7px', cursor: 'pointer', fontSize: 11, fontFamily: 'inherit', lineHeight: '18px', opacity: 0.85 };
     const SB_CAT_ON = { border: '1px solid rgba(128,128,128,.6)', background: 'rgba(128,128,128,.14)', color: 'inherit', borderRadius: 6, padding: '0 7px', cursor: 'pointer', fontSize: 11, fontFamily: 'inherit', lineHeight: '18px', fontWeight: 600 };
     const SB_ALL = { border: 'none', background: 'transparent', color: 'inherit', cursor: 'pointer', fontSize: 11, fontFamily: 'inherit', opacity: 0.6, padding: 0 };
@@ -3100,6 +3544,7 @@ window.__ModuleLoader__.load({
       const sc = useScene();
       const terms = useMemo(() => searchTerms(q), [q]);
       const own = q.trim().toLowerCase();
+      const askLike = looksLikeQuestion(q);
       const chips = terms.filter((t) => String(t.w).toLowerCase() !== own).slice(0, 8);
       const [openAll, setOpenAll] = useState(false);
       const cur = sceneById(sc);
@@ -3191,6 +3636,31 @@ window.__ModuleLoader__.load({
               ),
             )
           : null,
+        /* 咨询并入搜索框：输入像问题/链接时，先给一个「问出去」的按钮；
+           没在打字时给一排常用问法。点下去只切页，不自动发送，字还能改。 */
+        h(
+          'div',
+          { style: SB_CHIPS },
+          askLike
+            ? h(
+                'button',
+                {
+                  key: 'ask',
+                  onClick: () => setConsult(true, q),
+                  style: SB_ASK,
+                  title: '把这句话交给模型推演（不会自动发送）',
+                },
+                '问模型：' + (q.length > 16 ? q.slice(0, 16) + '…' : q),
+              )
+            : h(
+                'span',
+                null,
+                h('span', { style: SB_HINT }, '问模型'),
+                CONSULT_QUICK.map((t) =>
+                  h('button', { key: t, onClick: () => setConsult(true, t), style: SB_CHIP, title: '问模型：' + t }, t),
+                ),
+              ),
+        ),
       );
     }
 
@@ -3546,6 +4016,85 @@ window.__ModuleLoader__.load({
               ),
             )
           : h('div', { className: 'ddp-watched-empty' }, '还没有关注任何仓库。'),
+      );
+    }
+
+    /* ── 右栏「我关注的」高度：默认按内容长到 66%，顶上的把手可拖，双击还原 ── */
+    const WATCH_MIN_H = 112;
+    const WATCH_H_KEY = 'ddp.watchH';
+    let watchH = (() => {
+      try {
+        const v = Number(window.localStorage.getItem(WATCH_H_KEY));
+        return Number.isFinite(v) && v >= WATCH_MIN_H ? Math.round(v) : 0;
+      } catch (e) {
+        return 0;
+      }
+    })();
+    const watchHSubs = new Set();
+    function setWatchH(px, save) {
+      const next = Number(px) > 0 ? Math.round(Number(px)) : 0;
+      if (save) {
+        try {
+          window.localStorage.setItem(WATCH_H_KEY, String(next));
+        } catch (e) {
+          /* 存不了就算了，这一窗里还是生效的 */
+        }
+      }
+      if (next === watchH) return;
+      watchH = next;
+      watchHSubs.forEach((f) => f());
+    }
+    function useWatchH() {
+      const [, force] = useState(0);
+      useEffect(() => {
+        const f = () => force((x) => x + 1);
+        watchHSubs.add(f);
+        return () => {
+          watchHSubs.delete(f);
+        };
+      }, []);
+      return watchH;
+    }
+    /** 拖动时的高度：不少于 112，不多于「栏高 − 140」，给上面那块留口气 */
+    function clampWatchH(h, colH) {
+      const max = Math.max(WATCH_MIN_H, Math.round((Number(colH) || 600) - 140));
+      return Math.max(WATCH_MIN_H, Math.min(Math.round(Number(h) || 0), max));
+    }
+    /** 右栏下面那张卡：把「我关注的」连把手一起包起来，四个视图共用一个高度。*/
+    function WatchCard(props) {
+      const height = useWatchH();
+      const ref = useRef(null);
+      const onDown = (e) => {
+        const el = ref.current;
+        if (!el || typeof window.addEventListener !== 'function') return;
+        if (e && typeof e.preventDefault === 'function') e.preventDefault();
+        const col = el.parentElement;
+        const colH = col && col.clientHeight ? col.clientHeight : 600;
+        const startY = Number(e && e.clientY) || 0;
+        const startH = el.getBoundingClientRect ? el.getBoundingClientRect().height : WATCH_MIN_H;
+        const move = (ev) => setWatchH(clampWatchH(startH - ((Number(ev && ev.clientY) || 0) - startY), colH));
+        const up = () => {
+          window.removeEventListener('mousemove', move);
+          window.removeEventListener('mouseup', up);
+          setWatchH(watchH, true);
+        };
+        window.addEventListener('mousemove', move);
+        window.addEventListener('mouseup', up);
+      };
+      return h(
+        'div',
+        {
+          className: 'dsk-watch' + (height ? ' is-sized' : ''),
+          ref: ref,
+          style: height ? { height: height + 'px', flex: '0 0 auto', maxHeight: '82%' } : undefined,
+        },
+        h('div', {
+          className: 'dsk-grip',
+          title: '拖动调整高度，双击还原',
+          onMouseDown: onDown,
+          onDoubleClick: () => setWatchH(0, true),
+        }),
+        h(WatchList, { w: props.w }),
       );
     }
     function WatchPanel(props) {
@@ -4658,6 +5207,37 @@ window.__ModuleLoader__.load({
       return /^deepseek-ai\//i.test(String(name || ''));
     }
 
+    /* 官方的东西只出现在底部「官方仓库」卡里，不进任何榜、任何列、搜索结果和推荐。
+       只认 owner=deepseek-ai 不够：npm 那条官方包可能只剩包名（@deepseek-ai/dsh-…），
+       仓库地址也可能只留在 repoUrl 里。 */
+    function isOfficialRow(row) {
+      if (!row) return false;
+      const fn = String(row.fullName || '');
+      const nm = String(row.name || row.displayName || '');
+      const repo = String(row.repoUrl || row.url || '');
+      return isOfficialRepo(fn) || /^@deepseek-ai\//i.test(nm) || /github\.com\/deepseek-ai\//i.test(repo);
+    }
+
+    /** npm 行只有包名时也要能点：落到 npm 包页，而不是拼一个不存在的 github 地址。 */
+    function npmPageOf(row) {
+      const url = String((row && row.npmUrl) || '');
+      if (/^https?:\/\/(www\.)?npmjs\.com\/package\//i.test(url)) return url;
+      const name = String((row && (row.name || row.displayName)) || '').trim();
+      return name ? 'https://www.npmjs.com/package/' + name : '';
+    }
+
+    /** 仓库地址常带 git+ 前缀和 .git 尾巴，直接塞进 href 浏览器不认——统一还原成网页地址。 */
+    function ghPageOf(row) {
+      const raw = String((row && (row.repoUrl || row.url)) || '')
+        .trim()
+        .replace(/^git\+/i, '');
+      const m = /^https?:\/\/(?:www\.)?github\.com\/([^/#?]+)\/([^/#?]+?)(?:\.git)?(?:[\/#?].*)?$/i.exec(raw);
+      if (m) return 'https://github.com/' + m[1] + '/' + m[2];
+      if (/^https?:\/\//i.test(raw) && !/npmjs\.com/i.test(raw) && !/github\.com/i.test(raw)) return raw;
+      const fn = String((row && row.fullName) || '');
+      return /^[^/\s]+\/[^/\s]+$/.test(fn) ? 'https://github.com/' + fn : '';
+    }
+
     function looksLikeDshPlugin(row) {
       const name = String((row && row.fullName) || '');
       const desc = String((row && row.description) || '');
@@ -4678,6 +5258,77 @@ window.__ModuleLoader__.load({
         .then((res) => res.json())
         .then((j) => (j && j.map) || {})
         .catch(() => ({}));
+    }
+
+    /* 榜单、全量三列、搜索、猜你喜欢都会画行，翻译就跟着「画出来的行」走：
+       行一出现就排进队列，攒够 15 条问一次宿主（宿主自带磁盘缓存），
+       翻到第几页就翻第几页——不用预先猜哪批会露出来，也不会为了 3000 行一次问光。 */
+    const ZH_STORE = new Map();
+    const ZH_INFLIGHT = new Set();
+    const ZH_FAILED = new Map();
+    const ZH_SUBS = new Set();
+    let zhQueue = [];
+    let zhTimer = null;
+
+    function zhEmit() {
+      for (const f of ZH_SUBS) {
+        try {
+          f();
+        } catch (e) {
+          /* 单个订阅出错别拖垮别的 */
+        }
+      }
+    }
+
+    /** 一次最多 15 条；没翻到的记一次失败，两次之后不再追（避免一直重问同一个词）。 */
+    function zhFlush() {
+      zhTimer = null;
+      const batch = zhQueue.splice(0, 15);
+      if (!batch.length) return;
+      zhAsk(batch).then((got) => {
+        const map = got || {};
+        let ok = 0;
+        for (const it of batch) {
+          ZH_INFLIGHT.delete(it.name);
+          const v = map[it.name];
+          if (v && !ZH_STORE.has(it.name)) {
+            ZH_STORE.set(it.name, v);
+            ok += 1;
+          } else if (!v) {
+            ZH_FAILED.set(it.name, (ZH_FAILED.get(it.name) || 0) + 1);
+          }
+        }
+        if (ok) zhEmit();
+        if (zhQueue.length) zhTimer = setTimeout(zhFlush, ok ? 0 : 1200);
+      });
+    }
+
+    function requestZh(name, desc) {
+      const n = String(name || '');
+      const d = String(desc || '').trim();
+      if (!n || !d || HAS_CJK.test(d)) return;
+      if (ZH_STORE.has(n) || ZH_INFLIGHT.has(n)) return;
+      if ((ZH_FAILED.get(n) || 0) >= 2) return;
+      ZH_INFLIGHT.add(n);
+      zhQueue.push({ name: n, desc: d.slice(0, 400) });
+      if (!zhTimer) zhTimer = setTimeout(zhFlush, zhQueue.length >= 15 ? 30 : 220);
+    }
+
+    /** 订阅翻译表：谁画了行谁订阅，翻译到一条就重画一次。 */
+    function useZhLive() {
+      const [, bump] = useState(0);
+      useEffect(() => {
+        let alive = true;
+        const f = () => {
+          if (alive) bump((x) => x + 1);
+        };
+        ZH_SUBS.add(f);
+        return () => {
+          alive = false;
+          ZH_SUBS.delete(f);
+        };
+      }, []);
+      return ZH_STORE;
     }
 
     const ZH_MEM = { at: 0, map: {} };
@@ -4884,13 +5535,17 @@ window.__ModuleLoader__.load({
 .dsk-b-new{color:#7ee2a8;border-color:rgba(126,226,168,.42);background:rgba(126,226,168,.12)}
 .dsk-side{display:flex;flex-direction:column;gap:6px;min-height:0;overflow:hidden}
 .dsk-side>.ddp-col{flex:1 1 auto;min-height:0;overflow:auto;background:var(--dsk-card);border:1px solid var(--dsk-line);border-radius:8px;display:flex;flex-direction:column}
-.dsk-watch{border:1px solid var(--dsk-line);border-radius:8px;background:var(--dsk-card);overflow:hidden;display:flex;flex:0 0 auto;max-height:42%;min-height:96px;flex-direction:column;min-height:0;flex:.62}
+.dsk-watch{border:1px solid var(--dsk-line);border-radius:8px;background:var(--dsk-card);overflow:hidden;display:flex;flex-direction:column;flex:0 0 auto;min-height:112px;max-height:66%}
+.dsk-grip{flex:0 0 auto;height:8px;display:flex;align-items:center;justify-content:center;cursor:ns-resize;background:transparent}
+.dsk-grip::after{content:'';width:28px;height:2px;border-radius:2px;background:currentColor;opacity:.16}
+.dsk-grip:hover::after{opacity:.45}
+.dsk-watch.is-sized .dsk-grip::after{opacity:.4}
 .dsk-watch .ddp-watched{padding:0;display:flex;flex-direction:column;min-height:0;flex:1}
 .dsk-watch .ddp-watched-head{padding:4px 9px 2px;border-bottom:1px solid var(--dsk-line)}
 .dsk-watch .ddp-watched-head span{display:none}
 .dsk-watch .ddp-watched-add{padding:4px 8px;gap:5px;display:flex}
 .dsk-watch .ddp-watched-input{font-size:calc(10.2px*var(--dsk-fs));padding:2px 6px}
-.dsk-watch .ddp-watched-list{overflow:auto;flex:1}
+.dsk-watch .ddp-watched-list{overflow:auto;flex:1 1 auto;min-height:0}
 .dsk-watch .ddp-watched-row{padding:3px 9px}
 .dsk-watch .ddp-watch-desc{display:none}
 .dsk-bottom{flex:0 0 auto;display:flex;gap:8px;min-height:0}
@@ -4918,14 +5573,26 @@ window.__ModuleLoader__.load({
     function DenseRowView(props) {
       const p = props.p;
       const badge = denseBadge(p);
-      const zhText = (props.zh && props.zh[p.fullName]) || '';
+      const zhLive = useZhLive();
+      const zhText = (props.zh && props.zh[p.fullName]) || zhLive.get(p.fullName) || '';
       const desc = zhText || p.description || '';
+      /* 只翻真的画出来的行：翻页、搜索、推荐都走这一条路 */
+      useEffect(() => {
+        requestZh(p.fullName, p.description);
+      }, [p.fullName, p.description]);
       const isWatch = !!(props.watched && props.watched[String(p.fullName).toLowerCase()]);
       const cmd = installCmd(p);
       const [copied, setCopied] = useState(false);
+      /* 点这一行去哪：按「这一列是从哪来的」决定。
+         N 列里点开当然去 npm；G 列去 GitHub；两边都有的行，行尾另有 G / N 两个小链接，
+         想跳另一边直接点那个，不用先猜。 */
+      const linkG = ghPageOf(p);
+      const linkN = npmPageOf(p);
+      const viaNpm = props.via === 'npm' || p.badge === 'N' || (p.source === 'npm' && !p.badge);
+      const href = (viaNpm ? linkN || linkG : linkG || linkN) || p.url || undefined;
       return h(
         'a',
-        { className: 'dsk-row', href: p.url, target: '_blank', rel: 'noreferrer', title: desc || p.fullName },
+        { className: 'dsk-row', href, target: '_blank', rel: 'noreferrer', title: desc || p.fullName },
         h('span', { className: 'n' }, String(props.idx + 1)),
         h(
           'span',
@@ -4963,6 +5630,36 @@ window.__ModuleLoader__.load({
               .slice(0, 2)
               .map((t) => h('u', { key: t, className: 'tag' }, String(t).trim())),
             p.archived ? h('u', { className: 'warn' }, '已归档') : null,
+            linkG && linkN
+              ? h(
+                  'span',
+                  { className: 'dsk-ln' },
+                  h(
+                    'a',
+                    {
+                      className: 'dsk-lk',
+                      href: linkG,
+                      target: '_blank',
+                      rel: 'noreferrer',
+                      title: '在 GitHub 打开仓库',
+                      onClick: (e) => e.stopPropagation(),
+                    },
+                    'G',
+                  ),
+                  h(
+                    'a',
+                    {
+                      className: 'dsk-lk',
+                      href: linkN,
+                      target: '_blank',
+                      rel: 'noreferrer',
+                      title: '在 npm 打开包页',
+                      onClick: (e) => e.stopPropagation(),
+                    },
+                    'N',
+                  ),
+                )
+              : null,
           ),
         ),
         h(
@@ -4997,6 +5694,21 @@ window.__ModuleLoader__.load({
             },
             isWatch ? '★' : '☆',
           ),
+          props.onDismiss
+            ? h(
+                'button',
+                {
+                  className: 'dsk-no',
+                  title: '不感兴趣（本地记住，不再推）',
+                  onClick: (e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    props.onDismiss(p.fullName);
+                  },
+                },
+                '×',
+              )
+            : null,
         ),
       );
     }
@@ -5016,7 +5728,7 @@ window.__ModuleLoader__.load({
           'div',
           { className: 'dsk-body' },
           (props.rows || []).length
-            ? props.rows.map((p, i) => h(DenseRowView, { key: p.fullName, p, idx: i, metric: props.metric(p), zh: props.zh, watched: props.watched, onWatch: props.onWatch }))
+            ? props.rows.map((p, i) => h(DenseRowView, { key: p.fullName, p, idx: i, via: props.via, metric: props.metric(p), zh: props.zh, watched: props.watched, onWatch: props.onWatch }))
             : h('div', { className: 'dsk-empty' }, props.empty || '这一栏暂时没有内容。'),
         ),
       );
@@ -5065,10 +5777,53 @@ window.__ModuleLoader__.load({
       );
     }
 
+    /**
+     * 咨询页：把「已装了什么 + 榜单元数据」拼进问题，交给宿主调模型。
+     * 跟旧版 AskPanel 的区别只在排版——它独占整块面板，不再挤在第四列里。
+     * seed 是搜索框带过来的那句话：只塞进输入框，不自动发送（用户还能改）。
+     */
+    function ConsultPage(props) {
+      const d = props.d;
+      const c = d.consult;
+      const seed = props.seed || '';
+      useEffect(() => {
+        if (seed) c.setQ(seed);
+        /* seed 变了（比如又点另一个常用词）才覆盖，用户自己打的字不受影响 */
+      }, [seed]);
+      return h(
+        'div',
+        { className: 'dsk-consult' },
+        h(
+          'div',
+          { className: 'dsk-consult-h' },
+          h('button', { className: 'dsk-back', onClick: props.onBack, title: '回到列表（搜索词还在）' }, '← 返回列表'),
+          h('span', { className: 'dsk-consult-t' }, '问模型'),
+          h('span', { className: 'dsk-consult-s' }, '基于全量目录和你的工作区画像回答，不联网找新插件'),
+        ),
+        h(AskPanel, { d: d }),
+        h(
+          'div',
+          { className: 'dsk-askhint' },
+          '想按关键词筛目录而不是问模型？',
+          h(
+            'button',
+            {
+              onClick: () => {
+                if (seed) setSearchQuery(seed);
+                setConsult(false);
+              },
+            },
+            '改成搜索「' + (seed ? (seed.length > 12 ? seed.slice(0, 12) + '…' : seed) : '当前词') + '」',
+          ),
+        ),
+      );
+    }
+
     function DensePanel() {
       const d = useDailyData();
       const w = useWatch();
       const sq = useSearchQuery();
+      const cq = useConsult();
       const src = useSource();
       const [npmReload, setNpmReload] = useState(0);
       /* ∩ 屏改用全量数据（.all）之后，npm 榜单只在 N 屏要，星数采样也不再需要单独拉 */
@@ -5108,10 +5863,47 @@ window.__ModuleLoader__.load({
         [all.gh, all.npm, npmTerms, dlMap],
       );
       const hits = useMemo(() => allHits(merged, npmTerms, 90), [merged, npmTerms]);
+      /* N 屏里点开默认去 npm；同一个包 GitHub 全量里也有的话打个 G∩N，
+         行尾还会多出 G / N 两个小标，想跳哪边点哪个。 */
+      const ghKeys = useMemo(() => {
+        const s = new Set();
+        for (const r of (all.gh && all.gh.items) || []) {
+          const k = allKeyOf(denseRow(r));
+          if (k) s.add(k);
+        }
+        return s;
+      }, [all.gh]);
+      const npmTagged = useMemo(() => {
+        const tag = (r) => Object.assign({}, r, { badge: ghKeys.has(allKeyOf(r)) ? 'G∩N' : 'N' });
+        return {
+          total: npmView.total,
+          date: npmView.date.map(tag),
+          hot: npmView.hot.map(tag),
+          kept: npmView.kept.map(tag),
+        };
+      }, [npmView, ghKeys]);
       const allBusy = all.status === 'loading' || all.status === 'error';
+      /* 猜你喜欢：勾选的会话 → 宿主扫描 → 模型出需求 → 本地目录检索 */
+      const [sessPick, setSessPick] = useState(() => readPick());
+      const [sugReload, setSugReload] = useState(0);
+      const sug = useSuggest(true, sugReload, sessPick);
+      const [dismiss, setDismiss] = useState(() => readDismiss());
+      const pool = useMemo(() => suggestPool(all.gh && all.gh.items, all.npm && all.npm.items), [all.gh, all.npm]);
+      const sugRows = useMemo(() => matchNeeds(sug.needs, pool, { limit: 5, skip: dismiss }), [sug.needs, pool, dismiss]);
+      const onDismiss = (name) => {
+        const next = Object.assign({}, dismiss, { [name]: Date.now() });
+        setDismiss(next);
+        writeDismiss(next);
+      };
+      const changePick = (list) => {
+        setSessPick(list);
+        writePick(list);
+      };
       /* 下载量接口会限流（429），取不到时 hot 列退回 npm 自己的相关度，kicker 也跟着变，别撒谎 */
       const npmHasDl = useMemo(() => (npm.items || []).some((r) => Number(r.downloads) > 0), [npm.items]);
       const rs = useRemoteSearch(sq, v.scene);
+      /* 远端搜索结果里也可能带出官方仓库，跟本地那几列一样剔掉 */
+      const rsRows = useMemo(() => (rs.items || []).filter((r) => !isOfficialRow(r)), [rs.items]);
       const localRows = useMemo(() => {
         const seen = {};
         const out = [];
@@ -5259,7 +6051,7 @@ window.__ModuleLoader__.load({
                 v.searching
                   ? (v.scene ? '分类「' + ((sceneById(v.scene) || {}).label || v.scene) + '」' : '搜索「' + sq.trim() + '」') +
                     ' · 榜内 ' + (v.searchHit || 0) + ' · 全站 ' +
-                    (rs.status === 'ready' ? rs.items.length : rs.status === 'loading' ? '…' : '—')
+                    (rs.status === 'ready' ? rsRows.length : rs.status === 'loading' ? '…' : '—')
                   : '收录 ' + (v.total || '—') + ' 个旧榜单仓库 · 三榜各 15 · 官方已剔除 · ',
                 v.searching
                   ? null
@@ -5297,10 +6089,13 @@ window.__ModuleLoader__.load({
         ),
         showPrefs ? h(DensePrefs, { prefs, onChange: change }) : null,
         showPrefs ? h(TokenBox, { onChange: () => setAllReload((x) => x + 1) }) : null,
+        showPrefs ? h(ScanBox, { pick: sessPick, onChange: changePick }) : null,
 
         d.error ? h('div', { className: 'ddp-fail' }, '榜单数据加载失败：' + d.error) : null,
 
-        src === 'both'
+        cq.open
+          ? h(ConsultPage, { d: d, seed: cq.seed, onBack: () => setConsult(false) })
+          : src === 'both'
           ? h(
               'div',
               { className: 'dsk-main' },
@@ -5343,6 +6138,7 @@ window.__ModuleLoader__.load({
                 kicker: 'npm only · N',
                 rows: merged.npmOnly,
                 hint: String(merged.npmOnlyCount),
+                via: 'npm',
                 metric: (p) => npmNum(p.downloads),
                 zh,
                 watched: watchedMap,
@@ -5357,8 +6153,16 @@ window.__ModuleLoader__.load({
               h(
                 'div',
                 { className: 'dsk-side' },
-                h(AskPanel, { d }),
-                h('div', { className: 'dsk-watch' }, h(WatchList, { w })),
+                h(SuggestPanel, {
+                    st: sug,
+                    rows: sugRows,
+                    onRefresh: () => setSugReload((x) => x + 1),
+                    onDismiss,
+                    zh,
+                    watched: watchedMap,
+                    onWatch: toggleWatch,
+                  }),
+                h(WatchCard, { w }),
               ),
             )
           : src === 'npm'
@@ -5368,8 +6172,9 @@ window.__ModuleLoader__.load({
               h(DenseCol, {
                 title: '最新发布',
                 kicker: 'by publish date',
-                rows: npmView.date,
+                rows: npmTagged.date,
                 hint: '15',
+                via: 'npm',
                 metric: (p) => agoShort(p.date),
                 zh,
                 watched: watchedMap,
@@ -5384,8 +6189,9 @@ window.__ModuleLoader__.load({
               h(DenseCol, {
                 title: '最常被用',
                 kicker: npmHasDl ? 'by weekly downloads' : 'by npm relevance',
-                rows: npmView.hot,
+                rows: npmTagged.hot,
                 hint: '15',
+                via: 'npm',
                 metric: (p) => (npmHasDl ? npmNum(p.downloads) : String(Math.round(Number(p.relevance) || 0))),
                 zh,
                 watched: watchedMap,
@@ -5400,8 +6206,9 @@ window.__ModuleLoader__.load({
               h(DenseCol, {
                 title: 'npm 推荐',
                 kicker: 'by npm relevance',
-                rows: npmView.kept,
+                rows: npmTagged.kept,
                 hint: '15',
+                via: 'npm',
                 metric: (p) => (p.relevance ? String(Math.round(p.relevance)) : '—'),
                 zh,
                 watched: watchedMap,
@@ -5416,8 +6223,16 @@ window.__ModuleLoader__.load({
               h(
                 'div',
                 { className: 'dsk-side' },
-                h(AskPanel, { d }),
-                h('div', { className: 'dsk-watch' }, h(WatchList, { w })),
+                h(SuggestPanel, {
+                    st: sug,
+                    rows: sugRows,
+                    onRefresh: () => setSugReload((x) => x + 1),
+                    onDismiss,
+                    zh,
+                    watched: watchedMap,
+                    onWatch: toggleWatch,
+                  }),
+                h(WatchCard, { w }),
               ),
             )
           : tab === 'watch'
@@ -5445,8 +6260,8 @@ window.__ModuleLoader__.load({
                     : rs.status === 'error'
                       ? 'failed'
                       : 'github · topic:dsh-plugin',
-                rows: rs.items || [],
-                hint: String((rs.items || []).length),
+                rows: rsRows,
+                hint: String(rsRows.length),
                 metric: (p) => '★' + fmtStars(p.stars),
                 zh,
                 watched: watchedMap,
@@ -5456,8 +6271,16 @@ window.__ModuleLoader__.load({
               h(
                 'div',
                 { className: 'dsk-side' },
-                h(AskPanel, { d }),
-                h('div', { className: 'dsk-watch' }, h(WatchList, { w })),
+                h(SuggestPanel, {
+                    st: sug,
+                    rows: sugRows,
+                    onRefresh: () => setSugReload((x) => x + 1),
+                    onDismiss,
+                    zh,
+                    watched: watchedMap,
+                    onWatch: toggleWatch,
+                  }),
+                h(WatchCard, { w }),
               ),
             )
           : h(
@@ -5499,10 +6322,28 @@ window.__ModuleLoader__.load({
               h(
                 'div',
                 { className: 'dsk-side' },
-                h(AskPanel, { d }),
-                h('div', { className: 'dsk-watch' }, h(WatchList, { w })),
+                h(SuggestPanel, {
+                    st: sug,
+                    rows: sugRows,
+                    onRefresh: () => setSugReload((x) => x + 1),
+                    onDismiss,
+                    zh,
+                    watched: watchedMap,
+                    onWatch: toggleWatch,
+                  }),
+                h(WatchCard, { w }),
               ),
             ),
+
+        /* 搜不到时别让人干瞪眼：给一条「问模型」的路，词原样带过去 */
+        v.searching && !hits.length && rs.status !== 'loading'
+          ? h(
+              'div',
+              { className: 'dsk-askhint' },
+              '全量目录里没有命中「' + sq.trim() + '」。',
+              h('button', { onClick: () => setConsult(true, sq) }, '把这个词问给模型'),
+            )
+          : null,
 
         h(
           'div',
@@ -5631,7 +6472,7 @@ window.__ModuleLoader__.load({
       );
 
     return {
-      __test: { zhIntro, cleanText, FramePanel, FrameB, WireBand, LeadBlock, ListBlock, AskPanel, WatchPanel, WatchList, useDailyData, buildConsultQuestion, scoreRepo, W_STAR, W_ACT, W_NEW, DensePanel, DenseCol, DenseRowView, denseRow, looksLikeDshPlugin, LEXICON, expandWeighted, searchTerms, matchScore, applySearch, SearchBar, setSearchQuery, getSearchQuery: () => searchQuery, SCENE_PRIMARY, sceneById, sceneTerms, setScene, getScene: () => sceneId, useRemoteSearch, englishTerms, remoteEmptyText, npmBuckets, npmFilter, npmNum, setSource, useSource, useNpmSource, getSource: () => srcMode, installCmd, trimRegistry, intersectBuckets, repoKeyOf, nextSource, useGhTop, GH_TOP_URL, useAllData, useAllDl, mergeAll, allHits, allKeyOf, allStamp, hhmm, agoHours, AllCol, TokenBox, ALL_URL, ALL_DL_URL, TOKEN_URL, A_STEP, pageOf },
+      __test: { zhIntro, cleanText, FramePanel, FrameB, WireBand, LeadBlock, ListBlock, AskPanel, WatchPanel, WatchList, useDailyData, buildConsultQuestion, scoreRepo, W_STAR, W_ACT, W_NEW, DensePanel, DenseCol, DenseRowView, denseRow, looksLikeDshPlugin, LEXICON, expandWeighted, searchTerms, matchScore, applySearch, SearchBar, setSearchQuery, getSearchQuery: () => searchQuery, SCENE_PRIMARY, sceneById, sceneTerms, setScene, getScene: () => sceneId, useRemoteSearch, englishTerms, remoteEmptyText, npmBuckets, npmFilter, npmNum, setSource, useSource, useNpmSource, getSource: () => srcMode, installCmd, trimRegistry, intersectBuckets, repoKeyOf, nextSource, useGhTop, GH_TOP_URL, useAllData, useAllDl, mergeAll, allHits, allKeyOf, allStamp, hhmm, agoHours, AllCol, TokenBox, ALL_URL, ALL_DL_URL, TOKEN_URL, A_STEP, pageOf, suggestPool, matchNeeds, useSuggest, useSessions, SuggestPanel, SuggestRow, ScanBox, SUGGEST_URL, SESSIONS_URL, SCAN_URL, readPick, writePick, readDismiss, writeDismiss, ConsultPage, setConsult, useConsult, getConsult: () => ({ open: consultOpen, seed: consultSeed }), looksLikeQuestion, CONSULT_QUICK, isOfficialRow, npmPageOf, ghPageOf, WatchCard, setWatchH, getWatchH: () => watchH, clampWatchH, WATCH_MIN_H },
       inject: ['slots'],
       apply(ctx) {
         // 1) 左侧导航栏（和「任务看板」/「任务清单」同一排）：点它切到下面的主区域面板。

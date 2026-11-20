@@ -1,6 +1,6 @@
 {
   "name": "dsh-daily-push",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "每日推送：DSH 插件雷达。GitHub 与 npm 全量对照（G / G∩N / N 角标）+ 三榜并列 + 中文搜索，可填 GitHub 令牌提高上限，每行一键复制安装命令。",
   "license": "MIT",
   "author": "dsh-daily-push contributors",
